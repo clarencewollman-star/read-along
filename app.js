@@ -28,6 +28,7 @@ function show(name) {
   $('btnHome').hidden = name === 'home';
   if (name !== 'camera') stopCamera();
   if (name !== 'reader') stopSpeech();
+  if (name !== 'reader' && typeof edit !== 'undefined' && edit.on) setEditing(false);
   window.scrollTo(0, 0);
 }
 
@@ -517,25 +518,11 @@ async function readPage() {
     const lines = [];
     for (let i = 0; i < regions.length; i++) {
       busy('Finding the words…', i / regions.length);
-      const r = regions[i];
-      const crop = cropRegion(state.ocrCanvas, r);
-      const read = async (canvas, map) => {
-        const { data } = await worker.recognize(canvas, {}, { blocks: true, text: false });
-        const found = collectLines(data, map);
-        return { found, score: found.reduce((s, l) => s + l.score, 0) };
-      };
-      // On a curved page, leveling helps some sections and hurts others:
-      // read tilted sections both ways and keep the version the reader is surer of.
-      const ox = r.x - CROP_PAD, oy = r.y - CROP_PAD;
-      let best = await read(crop, (x, y) => [x + ox, y + oy]);
-      const level = levelText(crop, ox, oy);
-      if (level.canvas !== crop) {
-        const alt = await read(level.canvas, level.map);
-        if (alt.score > best.score) best = alt;
-      }
-      lines.push(...best.found);
+      lines.push(...await readRegionLines(regions[i]));
     }
-    buildZones(lines, regions);
+    state.autoSpecs = buildZones(lines, regions);
+    setZones(state.autoSpecs.map((s) => ({ ...s })));
+    if (edit.on) setEditing(false);
     renderReader();
     busy(false);
     show('reader');
@@ -547,6 +534,27 @@ async function readPage() {
     show('home');
     note('homeNote', 'Something went wrong while reading the page. The first time, it needs the internet to download the reader.');
   }
+}
+
+/* Read the text lines in one area of the page (page pixels; may have curved column edges). */
+async function readRegionLines(r) {
+  const worker = await getWorker();
+  const crop = cropRegion(state.ocrCanvas, r);
+  const read = async (canvas, map) => {
+    const { data } = await worker.recognize(canvas, {}, { blocks: true, text: false });
+    const found = collectLines(data, map);
+    return { found, score: found.reduce((s, l) => s + l.score, 0) };
+  };
+  // On a curved page, leveling helps some sections and hurts others:
+  // read tilted sections both ways and keep the version the reader is surer of.
+  const ox = r.x - CROP_PAD, oy = r.y - CROP_PAD;
+  let best = await read(crop, (x, y) => [x + ox, y + oy]);
+  const level = levelText(crop, ox, oy);
+  if (level.canvas !== crop) {
+    const alt = await read(level.canvas, level.map);
+    if (alt.score > best.score) best = alt;
+  }
+  return best.found;
 }
 
 function cleanWord(t) {
@@ -945,21 +953,38 @@ function buildZones(allLines, regions) {
     }
   });
 
-  const zones = [];
-  const words = [];
+  state.textH = textH;
+  const specs = [];
   for (const g of groups.values()) {
     for (const para of splitParagraphs(readingRows(g, textH), textH)) {
       const zw = para.flat();
       // A speck with hardly any letters is not worth a zone.
       if (zw.map((w) => w.text).join('').replace(/[^A-Za-z0-9]/g, '').length < 2) continue;
-      const zoneWords = zw.map((w) => {
-        const word = { id: words.length, text: w.text, bbox: w.bbox, zone: zones.length };
-        words.push(word);
-        return word;
-      });
-      zones.push({ id: zones.length, words: zoneWords, box: unionBox(zoneWords), sentences: splitSentences(zoneWords) });
+      specs.push({ words: zw.map((w) => ({ text: w.text, bbox: w.bbox })), prio: 0 });
     }
   }
+  return specs;
+}
+
+/* Turn zone descriptions into the live zones and words the reader uses.
+   A spec is { words: [{text, bbox}], prio, box? } — `box` and a higher `prio` come from
+   a zone drawn by hand: its box is kept exactly as drawn and wins over others. */
+function setZones(specs) {
+  state.specs = specs;
+  const zones = [];
+  const words = [];
+  specs.forEach((spec, si) => {
+    if (!spec.words.length) return;
+    const zoneWords = spec.words.map((w) => {
+      const word = { id: words.length, text: w.text, bbox: w.bbox, zone: zones.length };
+      words.push(word);
+      return word;
+    });
+    zones.push({
+      id: zones.length, spec: si, words: zoneWords, prio: spec.prio || 0, manual: !!spec.box,
+      box: spec.box || unionBox(zoneWords), sentences: splitSentences(zoneWords),
+    });
+  });
   state.zones = zones;
   state.words = words;
 }
@@ -1038,6 +1063,19 @@ function separateBoxes(boxes) {
         const oy = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
         if (ox <= 0 || oy <= 0) continue;
         changed = true;
+        // A zone drawn by hand (higher prio) keeps its box; the other one moves out of its way.
+        if ((a.prio || 0) !== (b.prio || 0)) {
+          const [hi, lo] = (a.prio || 0) > (b.prio || 0) ? [a, b] : [b, a];
+          const cut = [
+            { side: 'y1', v: hi.y0 - 1, cost: lo.y1 - (hi.y0 - 1) },
+            { side: 'y0', v: hi.y1 + 1, cost: (hi.y1 + 1) - lo.y0 },
+            { side: 'x1', v: hi.x0 - 1, cost: lo.x1 - (hi.x0 - 1) },
+            { side: 'x0', v: hi.x1 + 1, cost: (hi.x1 + 1) - lo.x0 },
+          ].map((c) => ({ ...c, cost: c.cost / (c.side[0] === 'y' ? lo.y1 - lo.y0 : lo.x1 - lo.x0) }))
+            .sort((p, q) => p.cost - q.cost)[0];
+          lo[cut.side] = cut.v;
+          continue;
+        }
         // Cut along whichever direction needs the smaller trim.
         if (oy / Math.min(a.y1 - a.y0, b.y1 - b.y0) <= ox / Math.min(a.x1 - a.x0, b.x1 - b.x0)) {
           const [top, bot] = (a.y0 + a.y1) <= (b.y0 + b.y1) ? [a, b] : [b, a];
@@ -1070,22 +1108,28 @@ function splitSentences(words) {
 }
 
 function renderReader() {
-  const W = state.pageCanvas.width, H = state.pageCanvas.height;
   $('pageImg').src = state.pageCanvas.toDataURL('image/jpeg', 0.92);
+  renderOverlay();
+}
+
+function renderOverlay() {
+  const W = state.pageCanvas.width, H = state.pageCanvas.height;
   const overlay = $('overlay');
   overlay.innerHTML = '';
   const pct = (v, total) => (v / total) * 100 + '%';
   const pad = Math.round(Math.max(W, H) * 0.006);
 
-  // A little breathing room around each zone, then trim so no two zones overlap.
-  const boxes = separateBoxes(state.zones.map((z) => ({
-    x0: z.box.x0 - pad, y0: z.box.y0 - pad, x1: z.box.x1 + pad, y1: z.box.y1 + pad,
-  })));
+  // A little breathing room around automatic zones (hand-drawn ones stay exactly as
+  // drawn), then trim so no two zones overlap.
+  const boxes = separateBoxes(state.zones.map((z) => {
+    const p = z.manual ? 0 : pad;
+    return { x0: z.box.x0 - p, y0: z.box.y0 - p, x1: z.box.x1 + p, y1: z.box.y1 + p, prio: z.prio };
+  }));
 
   state.zoneEls = state.zones.map((z, i) => {
     const b = boxes[i];
     const el = document.createElement('div');
-    el.className = 'zone';
+    el.className = 'zone' + (edit.selected === z.spec ? ' selected' : '');
     el.dataset.z = z.id;
     el.style.setProperty('--zc', ZONE_COLORS[z.id % ZONE_COLORS.length]);
     el.style.left = pct(b.x0, W);
@@ -1109,7 +1153,140 @@ function renderReader() {
   });
 }
 
+/* ---------------- Changing zones by hand ---------------- */
+
+const edit = { on: false, selected: -1, start: null, draft: null };
+
+function pagePoint(e) {
+  const rect = $('overlay').getBoundingClientRect();
+  const W = state.pageCanvas.width, H = state.pageCanvas.height;
+  return [
+    Math.max(0, Math.min(W, (e.clientX - rect.left) / rect.width * W)),
+    Math.max(0, Math.min(H, (e.clientY - rect.top) / rect.height * H)),
+  ];
+}
+
+function setEditing(on) {
+  edit.on = on;
+  edit.selected = -1;
+  stopSpeech();
+  $('page').classList.toggle('editing', on);
+  $('editTools').hidden = !on;
+  document.querySelector('#screen-reader .reader-tools:not(.edit-tools)').hidden = on;
+  $('btnRemoveZone').disabled = true;
+  // While editing, shrink the page to fit the screen so boxes can be drawn without scrolling.
+  if (on) {
+    window.scrollTo(0, 0);
+    const top = $('page').getBoundingClientRect().top;
+    const fit = (window.innerHeight - top - 16) * state.pageCanvas.width / state.pageCanvas.height;
+    $('page').style.maxWidth = Math.max(280, Math.min(900, fit)) + 'px';
+  } else {
+    $('page').style.maxWidth = '';
+  }
+  renderOverlay();
+}
+
+function selectZone(spec) {
+  edit.selected = spec;
+  $('btnRemoveZone').disabled = spec < 0;
+  state.zoneEls.forEach((el, i) => el.classList.toggle('selected', state.zones[i].spec === spec));
+}
+
+$('overlay').addEventListener('pointerdown', (e) => {
+  if (!edit.on) return;
+  e.preventDefault();
+  edit.start = { pt: pagePoint(e), x: e.clientX, y: e.clientY, zone: e.target.closest('.zone') };
+  $('overlay').setPointerCapture(e.pointerId);
+});
+
+$('overlay').addEventListener('pointermove', (e) => {
+  if (!edit.on || !edit.start) return;
+  if (Math.hypot(e.clientX - edit.start.x, e.clientY - edit.start.y) < 10 && !edit.draft) return;
+  const [x0, y0] = edit.start.pt, [x1, y1] = pagePoint(e);
+  const W = state.pageCanvas.width, H = state.pageCanvas.height;
+  if (!edit.draft) {
+    edit.draft = document.createElement('div');
+    edit.draft.className = 'draft';
+    $('overlay').appendChild(edit.draft);
+  }
+  edit.draft.style.left = Math.min(x0, x1) / W * 100 + '%';
+  edit.draft.style.top = Math.min(y0, y1) / H * 100 + '%';
+  edit.draft.style.width = Math.abs(x1 - x0) / W * 100 + '%';
+  edit.draft.style.height = Math.abs(y1 - y0) / H * 100 + '%';
+});
+
+const endDraw = async (e) => {
+  if (!edit.on || !edit.start) return;
+  const start = edit.start;
+  edit.start = null;
+  if (!edit.draft) { // a tap: pick the zone under the finger
+    selectZone(start.zone ? state.zones[+start.zone.dataset.z].spec : -1);
+    return;
+  }
+  edit.draft.remove();
+  edit.draft = null;
+  if (e.type === 'pointercancel') return;
+  const [x0, y0] = start.pt, [x1, y1] = pagePoint(e);
+  const box = { x0: Math.min(x0, x1), y0: Math.min(y0, y1), x1: Math.max(x0, x1), y1: Math.max(y0, y1) };
+  if (box.x1 - box.x0 < 15 || box.y1 - box.y0 < 10) return;
+  await addZone(box);
+};
+$('overlay').addEventListener('pointerup', endDraw);
+$('overlay').addEventListener('pointercancel', endDraw);
+
+/* Make a zone from a box drawn by hand: read the text inside just that box (more reliable
+   than the whole-page read), and take those words away from any other zone. */
+async function addZone(box) {
+  const center = (w) => [(w.bbox.x0 + w.bbox.x1) / 2, (w.bbox.y0 + w.bbox.y1) / 2];
+  const inside = (w) => { const [x, y] = center(w); return x >= box.x0 && x <= box.x1 && y >= box.y0 && y <= box.y1; };
+  busy('Reading the words in your box…');
+  let found = [];
+  try {
+    const r = { x: Math.round(box.x0), y: Math.round(box.y0), w: Math.round(box.x1 - box.x0), h: Math.round(box.y1 - box.y0) };
+    const lines = await readRegionLines(r);
+    found = lines.flatMap((l, li) => l.words.map((w) => ({ text: w.text, bbox: w.bbox, line: li })));
+    found = found.filter(inside);
+    found = readingRows(found, state.textH || 30).flat().map((w) => ({ text: w.text, bbox: w.bbox }));
+  } catch (err) { console.error(err); }
+  busy(false);
+
+  const specs = state.specs.map((s) => ({ ...s, words: s.words.filter((w) => !inside(w)) }));
+  if (!found.length) { // nothing read in the box: fall back to words already found there
+    found = state.specs.flatMap((s) => s.words.filter(inside));
+  }
+  if (!found.length) {
+    note('readerNote', 'No words were found in that box. Try drawing it a little bigger around the text.');
+    return;
+  }
+  note('readerNote', '');
+  edit.prio = (edit.prio || 0) + 1;
+  specs.push({ words: found, box, prio: 1000 + edit.prio });
+  setZones(specs.filter((s) => s.words.length));
+  selectZone(-1);
+  renderOverlay();
+}
+
+$('btnEdit').addEventListener('click', () => setEditing(true));
+$('btnEditDone').addEventListener('click', () => setEditing(false));
+$('btnRemoveZone').addEventListener('click', () => {
+  if (edit.selected < 0) return;
+  setZones(state.specs.filter((_, i) => i !== edit.selected));
+  selectZone(-1);
+  renderOverlay();
+});
+$('btnClearZones').addEventListener('click', () => {
+  setZones([]);
+  selectZone(-1);
+  renderOverlay();
+});
+$('btnAutoZones').addEventListener('click', () => {
+  setZones(state.autoSpecs.map((s) => ({ ...s })));
+  selectZone(-1);
+  renderOverlay();
+});
+
 $('overlay').addEventListener('click', (e) => {
+  if (edit.on) return;
   const wordEl = e.target.closest('.word');
   const zoneEl = e.target.closest('.zone');
   if (state.mode === 'word') {

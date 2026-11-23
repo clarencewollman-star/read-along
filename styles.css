@@ -107,6 +107,20 @@ button:active { transform: scale(0.97); }
   box-shadow: 0 0 0 9999px rgba(20, 24, 35, 0.45);
 }
 
+/* Zone editing */
+.reader-tools[hidden] { display: none; }
+.edit-tools { border-bottom: 2px dashed var(--line); }
+.edit-hint { flex-basis: 100%; margin: 0; font-size: 1.1rem; }
+.btn:disabled { opacity: 0.45; cursor: default; }
+.page.editing .overlay { cursor: crosshair; touch-action: none; }
+.page.editing .word { display: none; }
+.page.editing .zone { cursor: pointer; }
+.zone.selected { border-style: dashed; border-width: 5px; background: color-mix(in srgb, var(--zc) 25%, transparent); }
+.draft {
+  position: absolute; z-index: 5; pointer-events: none;
+  border: 3px dashed #3b6cf6; background: rgba(59, 108, 246, 0.12); border-radius: 8px;
+}
+
 .word { position: absolute; z-index: 3; border-radius: 4px; cursor: pointer; mix-blend-mode: multiply; }
 .word.sent { background: var(--sent); }
 .word.now { background: var(--hl); box-shadow: 0 0 0 3px var(--hl); }
