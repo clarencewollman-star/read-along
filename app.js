@@ -6,7 +6,7 @@ const $ = (id) => document.getElementById(id);
 
 // Shown at the top of every screen. Bump with every update (and the ?v= numbers in
 // index.html and CACHE in sw.js), so it's easy to see the newest version is running.
-const APP_VERSION = '7';
+const APP_VERSION = '8';
 const APP_DATE = 'Nov 23, 2026';
 $('version').textContent = 'Version ' + APP_VERSION + ' · ' + APP_DATE;
 const MAX_SIDE = 2400;          // largest photo side we keep (pixels)
@@ -1797,8 +1797,6 @@ function clearHighlights() {
   speech.sentEls = [];
   speech.sentence = null;
   state.zoneEls.forEach((el) => el.classList.remove('active'));
-  $('caption').hidden = true;
-  document.body.classList.remove('has-caption');
 }
 
 function setSentence(words) {
@@ -1806,17 +1804,6 @@ function setSentence(words) {
   speech.sentEls = words.map((w) => state.wordEls[w.id]);
   speech.sentEls.forEach((el) => el.classList.add('sent'));
   speech.sentence = words;
-  const cap = $('caption');
-  cap.innerHTML = '';
-  words.forEach((w, i) => {
-    const s = document.createElement('span');
-    s.textContent = w.text;
-    s.dataset.w = w.id;
-    cap.appendChild(s);
-    if (i < words.length - 1) cap.appendChild(document.createTextNode(' '));
-  });
-  cap.hidden = false;
-  document.body.classList.add('has-caption');
 }
 
 function highlightWord(w) {
@@ -1824,11 +1811,10 @@ function highlightWord(w) {
   const el = state.wordEls[w.id];
   el.classList.add('now');
   speech.nowEl = el;
-  $('caption').querySelectorAll('span').forEach((s) => s.classList.toggle('now', +s.dataset.w === w.id));
 
   // Keep the word on screen.
   const r = el.getBoundingClientRect();
-  const bottomLimit = window.innerHeight - ($('caption').hidden ? 0 : $('caption').offsetHeight) - 20;
+  const bottomLimit = window.innerHeight - 20;
   const topLimit = 150;
   if (r.top < topLimit || r.bottom > bottomLimit) {
     window.scrollBy({ top: r.top - (topLimit + bottomLimit) / 2, behavior: 'smooth' });

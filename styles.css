@@ -18,7 +18,6 @@ body {
   color: var(--ink);
   -webkit-tap-highlight-color: transparent;
 }
-body.has-caption { padding-bottom: 160px; }
 
 .topbar {
   position: sticky; top: 0; z-index: 20;
@@ -126,14 +125,6 @@ button:active { transform: scale(0.97); }
 .word.sent { background: var(--sent); }
 .word.now { background: var(--hl); box-shadow: 0 0 0 3px var(--hl); }
 
-.caption {
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
-  background: #fffdf5; border-top: 4px solid #e0a800;
-  padding: 14px 20px calc(14px + env(safe-area-inset-bottom));
-  font-size: clamp(1.4rem, 3vw, 2.1rem); line-height: 1.5; text-align: center;
-}
-.caption span { padding: 0 3px; border-radius: 6px; }
-.caption .now { background: #ffd600; }
 
 .busy {
   position: fixed; inset: 0; z-index: 50;
