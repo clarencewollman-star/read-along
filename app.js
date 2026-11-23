@@ -3,7 +3,8 @@
 /* Read Along — photograph a workbook page, find the text, tap a zone to hear it. */
 
 const $ = (id) => document.getElementById(id);
-const MAX_SIDE = 2400;          // largest image side we keep (pixels)
+const MAX_SIDE = 2400;          // largest photo side we keep (pixels)
+const PAGE_SIDE = 2600;         // long side of the straightened page used for reading
 const ZONE_COLORS = ['#4f8cff', '#22b07d', '#ff8a3d', '#b46bff', '#ff5c8a', '#14b8c4'];
 
 const state = {
@@ -298,24 +299,33 @@ function detectPage(src) {
     if (between > best) { best = between; thresh = t; }
   }
 
-  // Largest connected bright region
   const label = new Int32Array(w * h);
   const queue = new Int32Array(w * h);
-  let bestLabel = 0, bestSize = 0, next = 1;
-  for (let start = 0; start < w * h; start++) {
-    if (label[start] || gray[start] <= thresh) continue;
+  // Fill one connected bright region starting at `start`.
+  const grow = (start, id) => {
     let head = 0, tail = 0, size = 0;
     queue[tail++] = start;
-    label[start] = next;
+    label[start] = id;
     while (head < tail) {
       const p = queue[head++];
       size++;
       const x = p % w, y = (p / w) | 0;
       const nb = [x > 0 ? p - 1 : -1, x < w - 1 ? p + 1 : -1, y > 0 ? p - w : -1, y < h - 1 ? p + w : -1];
       for (const q of nb) {
-        if (q >= 0 && !label[q] && gray[q] > thresh) { label[q] = next; queue[tail++] = q; }
+        if (q >= 0 && !label[q] && gray[q] > thresh) {
+          label[q] = id;
+          queue[tail++] = q;
+        }
       }
     }
+    return size;
+  };
+
+  // The largest bright area in the photo is taken to be the page.
+  let bestLabel = 0, bestSize = 0, next = 1;
+  for (let start = 0; start < w * h; start++) {
+    if (label[start] || gray[start] <= thresh) continue;
+    const size = grow(start, next);
     if (size > bestSize) { bestSize = size; bestLabel = next; }
     next++;
   }
@@ -370,7 +380,8 @@ function warpPage(src, corners) {
   const d = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
   let W = Math.max(d(tl, tr), d(bl, br));
   let H = Math.max(d(tl, bl), d(tr, br));
-  const k = Math.min(1, MAX_SIDE / Math.max(W, H));
+  // Small text reads better when bigger, so enlarge the page (up to 2x) to about 2600px tall.
+  const k = Math.min(2, PAGE_SIDE / Math.max(W, H));
   W = Math.max(1, Math.round(W * k));
   H = Math.max(1, Math.round(H * k));
 
@@ -413,6 +424,69 @@ function warpPage(src, corners) {
 
 /* ---------------- Text recognition & zones ---------------- */
 
+/* Make a clean black-on-white copy of the page for the text reader:
+   - use the darkest color channel, so colored ink (brown, blue, red) turns dark;
+   - divide by the local paper brightness, which removes shadows and uneven light;
+   - push faint marks (text showing through from the back of the page) to white. */
+function enhanceForOcr(src) {
+  const w = src.width, h = src.height;
+  const p = src.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+  const gray = new Uint8Array(w * h);
+  for (let i = 0, j = 0; i < gray.length; i++, j += 4) {
+    gray[i] = Math.min(p[j], p[j + 1], p[j + 2]);
+  }
+
+  // Paper brightness on a coarse grid: brightest pixel per cell, then spread and smooth it.
+  const S = 32;
+  const gw = Math.ceil(w / S), gh = Math.ceil(h / S);
+  let bg = new Float32Array(gw * gh);
+  for (let y = 0; y < h; y++) {
+    const row = (y / S | 0) * gw;
+    for (let x = 0; x < w; x++) {
+      const c = row + (x / S | 0), v = gray[y * w + x];
+      if (v > bg[c]) bg[c] = v;
+    }
+  }
+  const filter = (a, fn) => {
+    const out = new Float32Array(a.length);
+    for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+      const vals = [];
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const yy = y + dy, xx = x + dx;
+        if (yy >= 0 && yy < gh && xx >= 0 && xx < gw) vals.push(a[yy * gw + xx]);
+      }
+      out[y * gw + x] = fn(vals);
+    }
+    return out;
+  };
+  bg = filter(bg, (v) => Math.max(...v));
+  bg = filter(bg, (v) => v.reduce((s, n) => s + n, 0) / v.length);
+
+  const out = document.createElement('canvas');
+  out.width = w; out.height = h;
+  const octx = out.getContext('2d');
+  const img = octx.createImageData(w, h);
+  const o = img.data;
+  const LO = 0.45, HI = 0.86; // ratio to paper: below LO = solid ink, above HI = paper
+  for (let y = 0; y < h; y++) {
+    const gy = Math.min(gh - 1.001, Math.max(0, y / S - 0.5));
+    const y0 = gy | 0, fy = gy - y0, y1 = Math.min(gh - 1, y0 + 1);
+    for (let x = 0; x < w; x++) {
+      const gx = Math.min(gw - 1.001, Math.max(0, x / S - 0.5));
+      const x0 = gx | 0, fx = gx - x0, x1 = Math.min(gw - 1, x0 + 1);
+      const b = (bg[y0 * gw + x0] * (1 - fx) + bg[y0 * gw + x1] * fx) * (1 - fy) +
+                (bg[y1 * gw + x0] * (1 - fx) + bg[y1 * gw + x1] * fx) * fy;
+      const r = gray[y * w + x] / Math.max(40, b);
+      const v = r <= LO ? 0 : r >= HI ? 255 : ((r - LO) / (HI - LO)) * 255;
+      const k = (y * w + x) * 4;
+      o[k] = o[k + 1] = o[k + 2] = v;
+      o[k + 3] = 255;
+    }
+  }
+  octx.putImageData(img, 0, 0);
+  return out;
+}
+
 const STATUS_TEXT = {
   'loading tesseract core': 'Getting the reader ready…',
   'initializing tesseract': 'Getting the reader ready…',
@@ -434,9 +508,34 @@ async function readPage() {
   try {
     busy('Getting the reader ready…');
     const worker = await getWorker();
-    busy('Finding the words…', 0);
-    const { data } = await worker.recognize(state.pageCanvas, {}, { blocks: true, text: true });
-    buildZones(data);
+    busy('Cleaning up the picture…');
+    await new Promise((r) => setTimeout(r, 30));
+    state.ocrCanvas = enhanceForOcr(state.pageCanvas);
+    // Read each column on its own, top to bottom and left to right. Curved pages
+    // otherwise make lines from side-by-side columns run into each other.
+    const regions = findRegions(state.ocrCanvas);
+    const lines = [];
+    for (let i = 0; i < regions.length; i++) {
+      busy('Finding the words…', i / regions.length);
+      const r = regions[i];
+      const crop = cropRegion(state.ocrCanvas, r);
+      const read = async (canvas, map) => {
+        const { data } = await worker.recognize(canvas, {}, { blocks: true, text: false });
+        const found = collectLines(data, map);
+        return { found, score: found.reduce((s, l) => s + l.score, 0) };
+      };
+      // On a curved page, leveling helps some sections and hurts others:
+      // read tilted sections both ways and keep the version the reader is surer of.
+      const ox = r.x - CROP_PAD, oy = r.y - CROP_PAD;
+      let best = await read(crop, (x, y) => [x + ox, y + oy]);
+      const level = levelText(crop, ox, oy);
+      if (level.canvas !== crop) {
+        const alt = await read(level.canvas, level.map);
+        if (alt.score > best.score) best = alt;
+      }
+      lines.push(...best.found);
+    }
+    buildZones(lines);
     renderReader();
     busy(false);
     show('reader');
@@ -463,23 +562,295 @@ function unionBox(items) {
   };
 }
 
-/* Group text lines into zones: lines close together belong to one zone; a bigger gap,
-   a change in text size, or a numbered/lettered item starts a new zone. */
-function buildZones(data) {
+/* Find side-by-side columns: a tall, clean white gap with text on both sides of it.
+   Returns rectangles (page pixels) in reading order: full-width bands, and for each
+   two-column section its left column then its right column. */
+function findRegions(canvas) {
+  const W = canvas.width, H = canvas.height;
+  const w = 600, f = w / W, h = Math.max(1, Math.round(H * f));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(canvas, 0, 0, w, h);
+  const p = ctx.getImageData(0, 0, w, h).data;
+  const ink = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) ink[i] = p[i * 4] < 150 ? 1 : 0;
+  // Columns that are dark most of the way down are background, the page edge or a shadow,
+  // not text: ignore them so they don't hide the blank rows between blocks of text.
+  for (let x = 0; x < w; x++) {
+    let n = 0;
+    for (let y = 0; y < h; y++) n += ink[y * w + x];
+    if (n > h * 0.35) for (let y = 0; y < h; y++) ink[y * w + x] = 0;
+  }
+
+  const pre = new Int32Array((w + 1) * h); // per-row running ink count
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) pre[y * (w + 1) + x + 1] = pre[y * (w + 1) + x] + ink[y * w + x];
+  }
+  const inkIn = (y, a, b) => {
+    a = Math.max(0, a); b = Math.min(w, b);
+    return b > a ? pre[y * (w + 1) + b] - pre[y * (w + 1) + a] : 0;
+  };
+
+  const REACH = 30;    // text must be this close on both sides of the gap
+  const MIN_ROWS = 45; // ...for at least this many rows (about 5 lines of text)
+  const MAX_BREAK = 14; // a longer stretch with no text beside the gap ends it (e.g. above a title)
+  const HALF_GAP = 3;   // a column gap is at least 7px wide here (about 21px on the page)
+  const cands = [];
+  // Real columns are at least a quarter of the page wide, which also ignores
+  // the gap between list numbers ("1.", "2.") and their text.
+  // The strip is 2*HALF_GAP+1 px wide: wider than the space between two words.
+  const isWhite = (y, x) => x - HALF_GAP >= 0 && x + HALF_GAP < w && inkIn(y, x - HALF_GAP, x + HALF_GAP + 1) === 0;
+
+  for (let x0 = Math.round(w * 0.25); x0 < w * 0.75; x0++) {
+    // 1) Follow the white strip down the page. On a curved page the gap between columns
+    //    bends, so when text blocks the way the strip may step one pixel left or right.
+    //    Record stretches that have text right beside them.
+    //    `solid` = the strip stayed white between the previous stretch and this one.
+    const path = new Int16Array(h);
+    const segs = [];
+    let seg = null, inkSincePrev = true, x = x0;
+    const close = () => { if (seg) segs.push(seg); seg = null; };
+    for (let y = 0; y < h; y++) {
+      const nx = isWhite(y, x) ? x : isWhite(y, x - 1) ? x - 1 : isWhite(y, x + 1) ? x + 1 : -1;
+      if (nx < 0) { close(); inkSincePrev = true; x = x0; path[y] = x0; continue; }
+      x = nx;
+      path[y] = x;
+      const beside = inkIn(y, x - REACH, x - HALF_GAP) && inkIn(y, x + HALF_GAP + 1, x + REACH + 1);
+      if (!beside) continue;
+      if (seg && y - seg.y1 > MAX_BREAK) close();
+      if (!seg) { seg = { y0: y, y1: y, count: 0, lines: 0, far: 0, solid: !inkSincePrev }; inkSincePrev = false; }
+      if (y - seg.y1 > 1 || seg.count === 0) seg.lines++; // a new line of text beside the gap
+      // In real columns the text carries on well past the gap on both sides;
+      // a list number ("1.") next to its sentence does not.
+      if (inkIn(y, x - 150, x - 40) && inkIn(y, x + 40, x + 150)) seg.far++;
+      seg.y1 = y;
+      seg.count++;
+    }
+    close();
+    // 2) Join stretches split by a short line (e.g. a paragraph's last line), as long as
+    //    the strip stayed white and the pieces look like the same text: either both hold
+    //    2+ lines, or their lines are the same height (a big lone title is not).
+    const lineH = (s) => s.count / s.lines;
+    const merged = [];
+    for (const s of segs) {
+      const prev = merged[merged.length - 1];
+      const sameText = (prev && prev.lines >= 2 && s.lines >= 2) ||
+        (prev && Math.max(lineH(prev), lineH(s)) / Math.min(lineH(prev), lineH(s)) < 1.5);
+      if (prev && s.solid && s.y0 - prev.y1 < 45 && sameText) {
+        prev.y1 = s.y1; prev.count += s.count; prev.lines += s.lines; prev.far += s.far;
+      } else merged.push({ ...s });
+    }
+    for (const s of merged) {
+      if (s.count >= MIN_ROWS && s.far >= s.count * 0.5) cands.push({ y0: s.y0, y1: s.y1, count: s.count, path: path.slice() });
+    }
+  }
+
+  // Many starting points find the same gap: keep the strongest version of each.
+  const xAt = (g, y) => g.path[Math.max(g.y0, Math.min(g.y1, y))];
+  cands.sort((a, b) => b.count - a.count);
+  const gutters = [];
+  for (const cd of cands) {
+    const same = gutters.some((g) => {
+      const a = Math.max(g.y0, cd.y0), b = Math.min(g.y1, cd.y1);
+      return b > a && Math.abs(xAt(g, (a + b) >> 1) - xAt(cd, (a + b) >> 1)) < 25;
+    });
+    if (!same) gutters.push(cd);
+  }
+
+  // Gutters that overlap vertically form one multi-column section.
+  gutters.sort((a, b) => a.y0 - b.y0);
+  const sections = [];
+  for (const g of gutters) {
+    const s = sections.find((s) => g.y0 < s.y1 && g.y1 > s.y0);
+    if (s) { s.gs.push(g); s.y0 = Math.min(s.y0, g.y0); s.y1 = Math.max(s.y1, g.y1); }
+    else sections.push({ gs: [g], y0: g.y0, y1: g.y1 });
+  }
+
+  // Cut between sections on the emptiest row nearby, so no line of text gets sliced.
+  const quietRow = (from, to) => {
+    let best = from, bestInk = Infinity;
+    for (let y = Math.max(0, from); y <= Math.min(h - 1, to); y++) {
+      const n = inkIn(y, 0, w);
+      if (n < bestInk) { bestInk = n; best = y; }
+    }
+    return best;
+  };
+
+  // A region is a rectangle in page pixels; a column region also has a curved left and/or
+  // right edge (page x for a page row) — anything beyond it gets blanked out before reading.
+  const regions = [];
+  const add = (y0, y1, left, right) => {
+    const xL = left ? Math.min(...Array.from({ length: y1 - y0 }, (_, i) => xAt(left, y0 + i))) : 0;
+    const xR = right ? Math.max(...Array.from({ length: y1 - y0 }, (_, i) => xAt(right, y0 + i))) : w;
+    const r = { x: Math.round(xL / f), y: Math.round(y0 / f) };
+    r.w = Math.min(W - r.x, Math.round(xR / f) - r.x);
+    r.h = Math.min(H - r.y, Math.round(y1 / f) - r.y);
+    if (left) r.left = (Y) => Math.round(xAt(left, Math.min(h - 1, Math.round(Y * f))) / f);
+    if (right) r.right = (Y) => Math.round(xAt(right, Math.min(h - 1, Math.round(Y * f))) / f);
+    if (r.w > 20 && r.h > 20) regions.push(r);
+  };
+  // Full-width stretches are split at blank rows, so a tilted block and the next
+  // block (e.g. a heading) are each leveled with their own angle.
+  const addBand = (y0, y1) => {
+    let start = y0, blank = 0;
+    for (let y = y0; y < y1; y++) {
+      if (inkIn(y, 0, w) <= 2) { blank++; continue; }
+      if (blank >= 4 && y - blank - start >= 20) {
+        const cut = y - (blank >> 1);
+        add(start, cut, null, null);
+        start = cut;
+      }
+      blank = 0;
+    }
+    add(start, y1, null, null);
+  };
+
+  let cursor = 0;
+  for (const s of sections) {
+    const top = Math.max(cursor, quietRow(s.y0 - 25, s.y0 - 1));
+    const bottom = quietRow(s.y1 + 1, s.y1 + 25);
+    if (top > cursor + 3) addBand(cursor, top);
+    const gs = s.gs.sort((a, b) => xAt(a, (s.y0 + s.y1) >> 1) - xAt(b, (s.y0 + s.y1) >> 1));
+    const edges = [null, ...gs, null];
+    for (let i = 0; i < edges.length - 1; i++) add(top, bottom, edges[i], edges[i + 1]);
+    cursor = bottom;
+  }
+  if (cursor < h - 3) addBand(cursor, h);
+  return regions;
+}
+
+/* Copy one region of the page for reading, blanking anything past a column's curved edges,
+   with a white margin of CROP_PAD around it (text touching the edge reads badly). */
+const CROP_PAD = 24;
+function cropRegion(src, r) {
+  const P = CROP_PAD;
+  const c = document.createElement('canvas');
+  c.width = r.w + P * 2; c.height = r.h + P * 2;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, c.width, c.height);
+  ctx.drawImage(src, r.x, r.y, r.w, r.h, P, P, r.w, r.h);
+  if (r.left || r.right) {
+    for (let Y = 0; Y < r.h; Y++) {
+      if (r.left) { const lx = r.left(r.y + Y) - r.x; if (lx > 0) ctx.fillRect(P, P + Y, lx, 1); }
+      if (r.right) { const rx = r.right(r.y + Y) - r.x; if (rx < r.w) ctx.fillRect(P + rx, P + Y, r.w - rx, 1); }
+    }
+  }
+  return c;
+}
+
+/* Measure how much the text in a region is tilted and turn it level.
+   Tries angles from -12° to 12° and keeps the one where ink lines up into the sharpest
+   horizontal rows. Returns the level canvas and a function that maps a point on it
+   back to page pixels. */
+function levelText(src, offX, offY) {
+  const identity = { canvas: src, map: (x, y) => [x + offX, y + offY] };
+  const s = Math.min(1, 500 / src.width);
+  const sw = Math.max(1, Math.round(src.width * s)), sh = Math.max(1, Math.round(src.height * s));
+  if (sh < 30) return identity;
+  const t = document.createElement('canvas');
+  t.width = sw; t.height = sh;
+  const tctx = t.getContext('2d', { willReadFrequently: true });
+  tctx.drawImage(src, 0, 0, sw, sh);
+  const p = tctx.getImageData(0, 0, sw, sh).data;
+  const xs = [], ys = [];
+  for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
+    if (p[(y * sw + x) * 4] < 128) { xs.push(x - sw / 2); ys.push(y - sh / 2); }
+  }
+  if (xs.length < 200) return identity;
+
+  const sharpness = (deg) => {
+    const a = deg * Math.PI / 180, sin = Math.sin(a), cos = Math.cos(a);
+    const off = Math.ceil(Math.hypot(sw, sh) / 2), hist = new Float64Array(off * 2 + 2);
+    for (let i = 0; i < xs.length; i++) hist[Math.round(xs[i] * sin + ys[i] * cos) + off]++;
+    let sum = 0;
+    for (const v of hist) sum += v * v;
+    return sum;
+  };
+  let best = 0, bestScore = sharpness(0);
+  for (let d = -12; d <= 12; d += 1) {
+    const sc = sharpness(d);
+    if (sc > bestScore) { best = d; bestScore = sc; }
+  }
+  for (let d = best - 0.75; d <= best + 0.75; d += 0.25) {
+    const sc = sharpness(d);
+    if (sc > bestScore) { best = d; bestScore = sc; }
+  }
+  if (Math.abs(best) < 0.75) return identity;
+
+  // Rotate by the angle that lined the ink up best, so the text runs level.
+  const a = best * Math.PI / 180, sin = Math.sin(a), cos = Math.cos(a);
+  const w = src.width, h = src.height;
+  const W2 = Math.ceil(w * Math.abs(cos) + h * Math.abs(sin));
+  const H2 = Math.ceil(w * Math.abs(sin) + h * Math.abs(cos));
+  const out = document.createElement('canvas');
+  out.width = W2; out.height = H2;
+  const octx = out.getContext('2d');
+  octx.fillStyle = '#fff';
+  octx.fillRect(0, 0, W2, H2);
+  octx.translate(W2 / 2, H2 / 2);
+  octx.rotate(a);
+  octx.drawImage(src, -w / 2, -h / 2);
+  const map = (u, v) => {
+    const dx = u - W2 / 2, dy = v - H2 / 2;
+    return [dx * cos + dy * sin + w / 2 + offX, -dx * sin + dy * cos + h / 2 + offY];
+  };
+  return { canvas: out, map };
+}
+
+/* Pull text lines (with page-pixel positions) out of a recognition result, dropping junk. */
+function collectLines(data, map) {
   const lines = [];
   for (const block of data.blocks || []) {
     for (const para of block.paragraphs || []) {
       for (const line of para.lines || []) {
         const ws = [];
+        let confSum = 0;
         for (const w of line.words || []) {
           const text = cleanWord(w.text || '');
-          if (!/[A-Za-z0-9]/.test(text) || w.confidence < 35) continue;
-          ws.push({ text, bbox: w.bbox });
+          if (!/[A-Za-z0-9]/.test(text) || w.confidence < 40) continue;
+          const b = w.bbox;
+          const pts = [map(b.x0, b.y0), map(b.x1, b.y0), map(b.x1, b.y1), map(b.x0, b.y1)];
+          ws.push({ text, conf: w.confidence, bbox: {
+            x0: Math.min(...pts.map((q) => q[0])), y0: Math.min(...pts.map((q) => q[1])),
+            x1: Math.max(...pts.map((q) => q[0])), y1: Math.max(...pts.map((q) => q[1])),
+          } });
+          confSum += w.confidence;
         }
-        if (ws.length) lines.push({ words: ws, bbox: unionBox(ws) });
+        if (!ws.length) continue;
+        // Lines that are mostly guesses are smudges, ruled lines or show-through: skip them.
+        if (confSum / ws.length < 60) continue;
+        // score: how much readable text this line adds = letters x how sure the reader is
+        const score = ws.reduce((s, w) => s + w.text.length * w.conf / 100, 0);
+        lines.push({ words: ws, bbox: unionBox(ws), score });
       }
     }
   }
+  return lines;
+}
+
+/* Typical letter height in a line (upper quarter of its word heights). */
+function textHeight(line) {
+  const hs = line.words.map((w) => w.bbox.y1 - w.bbox.y0).sort((a, b) => a - b);
+  return hs[Math.min(hs.length - 1, Math.floor(hs.length * 0.75))];
+}
+
+/* Vertical middle of a line's first word: lines in one column start at the same x,
+   so comparing first words is not thrown off by slanted lines. */
+function lineStart(line) {
+  const b = line.words[0].bbox;
+  return (b.y0 + b.y1) / 2;
+}
+
+/* Group text lines into zones: lines close together belong to one zone; a bigger gap,
+   a change in text size, or a numbered/lettered item starts a new zone. */
+function buildZones(allLines) {
+  // A page number or a stray letter on its own is not worth a zone.
+  const lines = allLines.filter((l) => {
+    const t = l.words.map((w) => w.text).join(' ');
+    return !(/^\d{1,3}$/.test(t) || t.replace(/[^A-Za-z]/g, '').length < 2 && !/\d/.test(t));
+  });
 
   const groups = [];
   let cur = null;
@@ -487,12 +858,15 @@ function buildZones(data) {
     const prev = cur && cur[cur.length - 1];
     let join = false;
     if (prev) {
-      const hPrev = prev.bbox.y1 - prev.bbox.y0, hLine = line.bbox.y1 - line.bbox.y0;
-      const gap = line.bbox.y0 - prev.bbox.y1;
+      // Measure with word heights, not whole-line boxes: on a curved page a slanted
+      // line's box is much taller than its letters.
+      const hPrev = textHeight(prev), hLine = textHeight(line);
+      const step = lineStart(line) - lineStart(prev); // distance from one line to the next
       const overlapX = Math.min(prev.bbox.x1, line.bbox.x1) - Math.max(prev.bbox.x0, line.bbox.x0);
-      const sameSize = Math.max(hPrev, hLine) / Math.max(1, Math.min(hPrev, hLine)) < 1.35;
+      const sameSize = Math.max(hPrev, hLine) / Math.max(1, Math.min(hPrev, hLine)) < 1.4;
       const startsItem = /^(\d{1,2}|[a-hA-H])[.)]$/.test(line.words[0].text);
-      join = gap > -hLine * 0.5 && gap < Math.max(hPrev, hLine) * 1.1 && overlapX > 0 && sameSize && !startsItem;
+      join = step > hLine * 0.4 && step < Math.max(hPrev, hLine) * 2.1 &&
+             overlapX > 0 && sameSize && !startsItem;
     }
     if (join) cur.push(line); else groups.push((cur = [line]));
   }
@@ -773,4 +1147,4 @@ if ('serviceWorker' in navigator && window.isSecureContext) {
 }
 
 // Exposed for testing in the browser console.
-window.readAlong = { loadImageFromUrl, state };
+window.readAlong = { loadImageFromUrl, findRegions, state };

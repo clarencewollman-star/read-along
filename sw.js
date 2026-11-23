@@ -1,7 +1,7 @@
 /* Keeps a copy of the app so it opens quickly and still works with a weak connection.
    The app's own files: try the network first (so updates show up), fall back to the copy.
    The reader library from the CDN: use the copy first (it never changes for a given version). */
-const CACHE = 'read-along-v1';
+const CACHE = 'read-along-v2';
 const APP_FILES = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.json', 'icons/icon-180.png', 'icons/icon-192.png'];
 
 self.addEventListener('install', (e) => {
