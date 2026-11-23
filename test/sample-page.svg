@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1400" viewBox="0 0 1600 1400">
+  <rect width="1600" height="1400" fill="#5a4636"/>
+  <g transform="rotate(-4 800 700)">
+    <rect x="330" y="80" width="940" height="1240" fill="#fbfaf6"/>
+    <g font-family="Arial, Helvetica, sans-serif" fill="#111">
+      <text x="380" y="170" font-size="44" font-weight="bold">Unit 3: Animals Around Us</text>
+      <rect x="370" y="210" width="860" height="130" fill="none" stroke="#333" stroke-width="3" rx="12"/>
+      <text x="395" y="262" font-size="28">Directions: Read the story. Then answer</text>
+      <text x="395" y="304" font-size="28">the questions below in full sentences.</text>
+      <text x="380" y="410" font-size="28">Beavers live near rivers and ponds. They use</text>
+      <text x="380" y="450" font-size="28">their strong teeth to cut down trees. Beavers</text>
+      <text x="380" y="490" font-size="28">build dams with sticks and mud. The dam makes</text>
+      <text x="380" y="530" font-size="28">a quiet pond where the beaver can build a home.</text>
+      <text x="380" y="650" font-size="28">1. Where do beavers live?</text>
+      <text x="380" y="720" font-size="28">______________________________________</text>
+      <text x="380" y="830" font-size="28">2. What do beavers use to cut down trees?</text>
+      <text x="380" y="900" font-size="28">______________________________________</text>
+      <text x="380" y="1010" font-size="28">3. Why do beavers build dams?</text>
+      <text x="380" y="1080" font-size="28">______________________________________</text>
+    </g>
+  </g>
+</svg>

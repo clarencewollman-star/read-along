@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Read Along">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="theme-color" content="#3b6cf6">
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <title>Read Along</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <button id="btnHome" class="btn" hidden>⟵ New page</button>
+    <h1>📚 Read Along</h1>
+  </header>
+
+  <main>
+    <!-- Start -->
+    <section id="screen-home" class="screen active">
+      <div class="home-card">
+        <p class="lead">Take a picture of a workbook page.<br>Then tap any box to hear it read out loud.</p>
+        <button id="btnCamera" class="big-btn primary">📷 Use camera</button>
+        <label class="big-btn">🖼️ Choose a photo
+          <input id="fileInput" type="file" accept="image/*" hidden>
+        </label>
+        <p id="homeNote" class="note" hidden></p>
+      </div>
+    </section>
+
+    <!-- Live camera -->
+    <section id="screen-camera" class="screen">
+      <div class="camera-wrap"><video id="video" playsinline muted autoplay></video></div>
+      <div class="controls">
+        <select id="cameraSelect" class="select" aria-label="Camera"></select>
+        <button id="btnSnap" class="big-btn primary">📸 Snap</button>
+      </div>
+    </section>
+
+    <!-- Crop -->
+    <section id="screen-crop" class="screen">
+      <p class="hint">Drag the 4 dots onto the corners of the page.</p>
+      <div class="crop-wrap"><canvas id="cropCanvas"></canvas></div>
+      <div class="controls">
+        <button id="btnRotate" class="btn">↻ Turn</button>
+        <button id="btnAuto" class="btn">✨ Find page</button>
+        <button id="btnFull" class="btn">⬚ Whole photo</button>
+        <button id="btnCropDone" class="big-btn primary">Done ✓</button>
+      </div>
+    </section>
+
+    <!-- Reader -->
+    <section id="screen-reader" class="screen">
+      <div class="reader-tools">
+        <div class="mode-toggle" role="group" aria-label="What to read">
+          <button id="modeZone" class="toggle active">📖 Read a box</button>
+          <button id="modeWord" class="toggle">🔤 Read a word</button>
+        </div>
+        <button id="btnStop" class="btn">⏹ Stop</button>
+        <button id="btnReplay" class="btn">🔁 Again</button>
+        <label class="speed" title="Reading speed">🐢
+          <input id="rate" type="range" min="0.5" max="1.5" step="0.05" value="0.9">🐇</label>
+        <select id="voiceSelect" class="select" aria-label="Voice"></select>
+        <button id="btnRecrop" class="btn">✂️ Fix crop</button>
+      </div>
+      <p id="readerNote" class="note" hidden></p>
+      <div id="page" class="page">
+        <img id="pageImg" alt="Workbook page">
+        <div id="overlay" class="overlay"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="caption" class="caption" hidden></div>
+
+  <div id="busy" class="busy" hidden>
+    <div class="busy-card">
+      <div class="spinner"></div>
+      <p id="busyText">Working…</p>
+      <progress id="busyProgress" max="1" value="0"></progress>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
