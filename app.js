@@ -423,6 +423,203 @@ function warpPage(src, corners) {
   return out;
 }
 
+/* ---------------- Flattening a curved page ---------------- */
+
+/* Solve the square linear system M x = b (Gaussian elimination with pivoting). */
+function solveLinear(M, b) {
+  const n = b.length;
+  const A = M.map((row, i) => [...row, b[i]]);
+  for (let c = 0; c < n; c++) {
+    let p = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+    [A[c], A[p]] = [A[p], A[c]];
+    if (Math.abs(A[c][c]) < 1e-12) return null;
+    for (let r = 0; r < n; r++) {
+      if (r === c) continue;
+      const k = A[r][c] / A[c][c];
+      if (k) for (let j = c; j <= n; j++) A[r][j] -= k * A[c][j];
+    }
+  }
+  return A.map((row, i) => row[n] / row[i]);
+}
+
+/* Work out how the page is bent, from its lines of print.
+   1. Smudge the ink sideways so the words of a line join into one long, thin blob.
+   2. Trace the middle of each blob from left to right: that is how the line bends.
+   3. Fit one smooth "bend" for the whole page that explains all the lines at once:
+        line's height at (x) = its own straight height + bend(x, y)
+      The bend is a gentle curve across the page that can change slowly down the page.
+   Returns bend(u, v) in page fractions (0..1), or null if the page is already flat. */
+function findPageCurve(canvas) {
+  const W = canvas.width, H = canvas.height;
+  const w = 800, f = w / W, h = Math.max(1, Math.round(H * f));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(canvas, 0, 0, w, h);
+  const p = ctx.getImageData(0, 0, w, h).data;
+  const ink = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) ink[i] = p[i * 4] < 140 ? 1 : 0;
+  for (let x = 0; x < w; x++) { // dark page edges / background are not print
+    let n = 0;
+    for (let y = 0; y < h; y++) n += ink[y * w + x];
+    if (n > h * 0.35) for (let y = 0; y < h; y++) ink[y * w + x] = 0;
+  }
+
+  // Join the letters and words of each line: fill small sideways gaps between ink on the
+  // same row (sideways only, so the lines above and below stay apart).
+  const GAP = 8;
+  const sm = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    let last = -1;
+    for (let x = 0; x < w; x++) {
+      if (!ink[y * w + x]) continue;
+      sm[y * w + x] = 1;
+      if (last >= 0 && x - last - 1 <= GAP) for (let k = last + 1; k < x; k++) sm[y * w + k] = 1;
+      last = x;
+    }
+  }
+
+  // Connected blobs and their boxes.
+  const label = new Int32Array(w * h);
+  const queue = new Int32Array(w * h);
+  const boxes = [null];
+  for (let s = 0; s < w * h; s++) {
+    if (!sm[s] || label[s]) continue;
+    const id = boxes.length;
+    const b = { x0: w, y0: h, x1: 0, y1: 0 };
+    let head = 0, tail = 0;
+    queue[tail++] = s;
+    label[s] = id;
+    while (head < tail) {
+      const q = queue[head++], x = q % w, y = (q / w) | 0;
+      if (x < b.x0) b.x0 = x; if (x > b.x1) b.x1 = x; if (y < b.y0) b.y0 = y; if (y > b.y1) b.y1 = y;
+      for (const n2 of [x > 0 ? q - 1 : -1, x < w - 1 ? q + 1 : -1, y > 0 ? q - w : -1, y < h - 1 ? q + w : -1]) {
+        if (n2 >= 0 && sm[n2] && !label[n2]) { label[n2] = id; queue[tail++] = n2; }
+      }
+    }
+    boxes.push(b);
+  }
+
+  // Line-shaped blobs: long and thin (not pictures, not two lines stuck together).
+  let cand = [];
+  for (let id = 1; id < boxes.length; id++) {
+    const b = boxes[id], bw = b.x1 - b.x0 + 1, bh = b.y1 - b.y0 + 1;
+    if (bw >= w * 0.08 && bw >= bh * 6) cand.push({ id, b, bh });
+  }
+  if (cand.length < 5) return null;
+  const hs = cand.map((cd) => cd.bh).sort((a, b) => a - b);
+  const medH = hs[hs.length >> 1];
+  cand = cand.filter((cd) => cd.bh <= medH * 2.2);
+  if (cand.length < 5) return null;
+
+  // Trace the middle of each line every few pixels.
+  const lines = [];
+  for (const cd of cand) {
+    const pts = [];
+    for (let x = cd.b.x0 + 2; x <= cd.b.x1 - 2; x += 4) {
+      let top = -1, bot = -1;
+      for (let y = cd.b.y0; y <= cd.b.y1; y++) {
+        if (label[y * w + x] === cd.id) { if (top < 0) top = y; bot = y; }
+      }
+      if (top >= 0) pts.push([x / w - 0.5, ((top + bot) / 2) / h - 0.5]);
+    }
+    if (pts.length >= 4) lines.push(pts);
+  }
+  if (lines.length < 5) return null;
+
+  // Fit: v = c_line + sum a_jk * u^j * vbar^k  (j = 1..3, k = 0..2), least squares.
+  const L = lines.length, K = 9, n = L + K;
+  const M = Array.from({ length: n }, () => new Float64Array(n));
+  const rhs = new Float64Array(n);
+  const basis = (u, v) => {
+    const out = [];
+    for (let k = 0; k <= 2; k++) for (let j = 1; j <= 3; j++) out.push(u ** j * v ** k);
+    return out;
+  };
+  lines.forEach((pts, i) => {
+    const vbar = pts.reduce((s, q) => s + q[1], 0) / pts.length;
+    for (const [u, v] of pts) {
+      const row = basis(u, vbar);
+      const idx = [i, ...row.map((_, k) => L + k)];
+      const val = [1, ...row];
+      for (let a = 0; a < idx.length; a++) {
+        rhs[idx[a]] += val[a] * v;
+        for (let b2 = 0; b2 < idx.length; b2++) M[idx[a]][idx[b2]] += val[a] * val[b2];
+      }
+    }
+  });
+  for (let k = 0; k < K; k++) M[L + k][L + k] += 1e-6; // keep it steady
+  const sol = solveLinear(M.map((r) => Array.from(r)), Array.from(rhs));
+  if (!sol) return null;
+  const a = sol.slice(L);
+  const bend = (u, v) => {
+    const b = basis(u - 0.5, v - 0.5);
+    let s = 0;
+    for (let k = 0; k < K; k++) s += a[k] * b[k];
+    return Math.max(-0.08, Math.min(0.08, s));
+  };
+
+  // Only flatten when it clearly helps: lines must be noticeably straighter afterwards.
+  let before = 0, after = 0, count = 0;
+  lines.forEach((pts, i) => {
+    const vbar = pts.reduce((s, q) => s + q[1], 0) / pts.length;
+    for (const [u, v] of pts) {
+      before += (v - vbar) ** 2;
+      after += (v - sol[i] - basis(u, vbar).reduce((s, bv, k) => s + a[k] * bv, 0)) ** 2;
+      count++;
+    }
+  });
+  const rmsBefore = Math.sqrt(before / count) * h, rmsAfter = Math.sqrt(after / count) * h;
+  if (rmsBefore < 0.8 || rmsAfter > rmsBefore * 0.75) return null;
+  return bend;
+}
+
+/* Redraw a picture with the bend taken out, so every line of print runs straight. */
+function unbend(src, bend) {
+  const W = src.width, H = src.height;
+  const sp = src.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, W, H).data;
+  const out = document.createElement('canvas');
+  out.width = W; out.height = H;
+  const octx = out.getContext('2d');
+  const img = octx.createImageData(W, H);
+  const op = img.data;
+  // The bend changes slowly, so work it out on a coarse grid and blend in between.
+  const G = 16, gw = Math.ceil(W / G) + 1, gh = Math.ceil(H / G) + 1;
+  const grid = new Float32Array(gw * gh);
+  for (let gy = 0; gy < gh; gy++) {
+    for (let gx = 0; gx < gw; gx++) {
+      const u = Math.min(1, gx * G / W), v0 = Math.min(1, gy * G / H);
+      // Find where this straight-line point came from: v = v0 + bend(u, v).
+      let v = v0;
+      for (let it = 0; it < 3; it++) v = v0 + bend(u, v);
+      grid[gy * gw + gx] = (v - v0) * H;
+    }
+  }
+  for (let y = 0; y < H; y++) {
+    const gy = y / G, y0 = Math.min(gh - 2, gy | 0), fy = gy - y0;
+    for (let x = 0; x < W; x++) {
+      const gx = x / G, x0 = Math.min(gw - 2, gx | 0), fx = gx - x0;
+      const d = (grid[y0 * gw + x0] * (1 - fx) + grid[y0 * gw + x0 + 1] * fx) * (1 - fy) +
+                (grid[(y0 + 1) * gw + x0] * (1 - fx) + grid[(y0 + 1) * gw + x0 + 1] * fx) * fy;
+      const o = (y * W + x) * 4;
+      const sy = y + d;
+      if (sy < 0 || sy > H - 1.001) { // past the edge of the photo: blank paper
+        op[o] = op[o + 1] = op[o + 2] = op[o + 3] = 255;
+        continue;
+      }
+      const yA = sy | 0, t = sy - yA;
+      const iA = (yA * W + x) * 4, iB = iA + W * 4;
+      op[o] = sp[iA] + (sp[iB] - sp[iA]) * t;
+      op[o + 1] = sp[iA + 1] + (sp[iB + 1] - sp[iA + 1]) * t;
+      op[o + 2] = sp[iA + 2] + (sp[iB + 2] - sp[iA + 2]) * t;
+      op[o + 3] = 255;
+    }
+  }
+  octx.putImageData(img, 0, 0);
+  return out;
+}
+
 /* ---------------- Text recognition & zones ---------------- */
 
 /* Make a clean black-on-white copy of the page for the text reader:
@@ -512,6 +709,15 @@ async function readPage() {
     busy('Cleaning up the picture…');
     await new Promise((r) => setTimeout(r, 30));
     state.ocrCanvas = enhanceForOcr(state.pageCanvas);
+    // A curved page: straighten the lines of print first (the page shown is straightened
+    // too, so the highlights land on the right words).
+    busy('Straightening curved lines…');
+    await new Promise((r) => setTimeout(r, 30));
+    const bend = findPageCurve(state.ocrCanvas);
+    if (bend) {
+      state.ocrCanvas = unbend(state.ocrCanvas, bend);
+      state.pageCanvas = unbend(state.pageCanvas, bend);
+    }
     // Read each column on its own, top to bottom and left to right. Curved pages
     // otherwise make lines from side-by-side columns run into each other.
     const regions = findRegions(state.ocrCanvas);
@@ -1499,4 +1705,4 @@ if ('serviceWorker' in navigator && window.isSecureContext) {
 }
 
 // Exposed for testing in the browser console.
-window.readAlong = { loadImageFromUrl, findRegions, state };
+window.readAlong = { loadImageFromUrl, findRegions, findPageCurve, unbend, enhanceForOcr, warpPage, state };
