@@ -6,7 +6,7 @@ const $ = (id) => document.getElementById(id);
 
 // Shown at the top of every screen. Bump with every update (and the ?v= numbers in
 // index.html and CACHE in sw.js), so it's easy to see the newest version is running.
-const APP_VERSION = '6';
+const APP_VERSION = '7';
 const APP_DATE = 'Nov 23, 2026';
 $('version').textContent = 'Version ' + APP_VERSION + ' · ' + APP_DATE;
 const MAX_SIDE = 2400;          // largest photo side we keep (pixels)
@@ -1535,34 +1535,73 @@ const speech = {
   sentence: null,
 };
 
+// Natural voices that come with the app (Piper, runs on the device; downloaded once).
+const NATURAL_VOICES = [
+  ['en_US-hfc_female-medium', 'Hannah'], ['en_US-amy-medium', 'Amy'],
+  ['en_US-ryan-medium', 'Ryan'], ['en_GB-alba-medium', 'Alba (British)'],
+];
+// Apple's joke/novelty voices: not for reading schoolwork.
+const NOVELTY = /^(Albert|Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Good News|Jester|Organ|Superstar|Trinoids|Whisper|Wobble|Zarvox|Eddy|Flo|Grandma|Grandpa|Reed|Rocko|Sandy|Shelley|Junior|Ralph|Fred|Kathy|Deranged|Hysterical|Pipe Organ)\b/i;
+
 function loadVoices() {
-  if (!('speechSynthesis' in window)) return;
-  const all = speechSynthesis.getVoices().filter((v) => /^en/i.test(v.lang));
-  if (!all.length) return;
+  const sys = 'speechSynthesis' in window
+    ? speechSynthesis.getVoices().filter((v) => /^en/i.test(v.lang) && !NOVELTY.test(v.name))
+    : [];
   const score = (v) =>
+    (/premium/i.test(v.name + v.voiceURI) ? 10 : 0) + (/enhanced/i.test(v.name + v.voiceURI) ? 6 : 0) +
     (/natural/i.test(v.name) ? 8 : 0) + (/online/i.test(v.name) ? 2 : 0) +
-    (/aria|jenny|ava|guy|samantha|zira/i.test(v.name) ? 3 : 0) + (/en-us/i.test(v.lang) ? 1 : 0);
-  all.sort((a, b) => score(b) - score(a));
+    (/aria|jenny|ava|guy|samantha|zira|zoe|evan|nathan|allison/i.test(v.name) ? 3 : 0) +
+    (/en-us/i.test(v.lang) ? 1 : 0);
+  sys.sort((a, b) => score(b) - score(a));
+
   const sel = $('voiceSelect');
   sel.innerHTML = '';
-  all.forEach((v) => sel.add(new Option(v.name.replace(/^Microsoft /, '').replace(/ - English.*$/, ''), v.name)));
+  const natGroup = document.createElement('optgroup');
+  natGroup.label = 'Natural voices (download once)';
+  NATURAL_VOICES.forEach(([id, name]) => natGroup.appendChild(new Option('✨ ' + name, 'natural:' + id)));
+  sel.appendChild(natGroup);
+  if (sys.length) {
+    const sysGroup = document.createElement('optgroup');
+    sysGroup.label = 'This device’s voices';
+    sys.forEach((v) => sysGroup.appendChild(new Option(v.name.replace(/^Microsoft /, '').replace(/ - English.*$/, ''), v.name)));
+    sel.appendChild(sysGroup);
+  }
+
   let saved = null;
   try { saved = localStorage.getItem('voice'); } catch {}
-  const pick = all.find((v) => v.name === saved) || all[0];
-  sel.value = pick.name;
-  speech.voice = pick;
+  const valid = [...sel.options].some((o) => o.value === saved);
+  sel.value = valid ? saved : (sys[0] ? sys[0].name : 'natural:' + NATURAL_VOICES[0][0]);
+  applyVoice(sel.value);
 }
 
+function applyVoice(value) {
+  if (value.startsWith('natural:')) {
+    speech.engine = 'natural';
+    speech.naturalVoice = value.slice(8);
+    speech.voice = null;
+  } else {
+    speech.engine = 'system';
+    speech.voice = ('speechSynthesis' in window && speechSynthesis.getVoices().find((v) => v.name === value)) || null;
+  }
+}
+
+loadVoices();
 if ('speechSynthesis' in window) {
-  loadVoices();
   speechSynthesis.addEventListener('voiceschanged', loadVoices);
   // iPad Safari sometimes fills the voice list late without telling us.
-  [500, 1500, 4000].forEach((ms) => setTimeout(() => { if (!$('voiceSelect').options.length) loadVoices(); }, ms));
+  [500, 1500, 4000].forEach((ms) => setTimeout(() => {
+    if (!$('voiceSelect').querySelector('optgroup + optgroup')) loadVoices();
+  }, ms));
 }
 
 $('voiceSelect').addEventListener('change', (e) => {
-  speech.voice = speechSynthesis.getVoices().find((v) => v.name === e.target.value) || null;
+  applyVoice(e.target.value);
   try { localStorage.setItem('voice', e.target.value); } catch {}
+  if (speech.engine === 'natural') {
+    stopSpeech();
+    unlockAudio(); // a tap/choice is the moment the iPad allows sound to be switched on
+    loadNatural(true).catch(() => {});
+  }
 });
 
 try {
@@ -1581,9 +1620,171 @@ function makeUtterance(text) {
   return u;
 }
 
+/* ---------------- Natural voice (Piper, runs on the device) ---------------- */
+
+const PIPER_URL = 'https://cdn.jsdelivr.net/npm/@mintplex-labs/piper-tts-web@1.0.5/+esm';
+// The voice engine files must be the same version the CDN pairs Piper with (1.27.0).
+const PIPER_PATHS = {
+  onnxWasm: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/',
+  piperData: 'https://cdn.jsdelivr.net/npm/@diffusionstudio/piper-wasm@1.0.0/build/piper_phonemize.data',
+  piperWasm: 'https://cdn.jsdelivr.net/npm/@diffusionstudio/piper-wasm@1.0.0/build/piper_phonemize.wasm',
+};
+
+const natural = {
+  mod: null, session: null, voiceLoaded: null, loading: null, loadingVoice: null,
+  cache: new Map(), el: null, timer: 0, decodeCtx: null, silence: null,
+};
+
+// One shared audio player. The iPad only lets a page play sound that was started by a
+// tap, so every tap that may lead to speech plays a moment of silence on it first;
+// after that the same player may play the voice when it is ready.
+function audioEl() {
+  if (!natural.el) {
+    natural.el = new Audio();
+    natural.el.preload = 'auto';
+    natural.el.preservesPitch = true;       // slower speech without a deeper voice
+    natural.el.webkitPreservesPitch = true;
+  }
+  return natural.el;
+}
+function unlockAudio() {
+  if (!natural.silence) {
+    const n = 800, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+    const str = (o, s) => [...s].forEach((ch, i) => v.setUint8(o + i, ch.charCodeAt(0)));
+    str(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, 16000, true); v.setUint32(28, 32000, true); v.setUint16(32, 2, true);
+    v.setUint16(34, 16, true); str(36, 'data'); v.setUint32(40, n * 2, true);
+    natural.silence = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+  }
+  const el = audioEl();
+  el.src = natural.silence;
+  el.play().catch(() => {});
+}
+
+// Load the chosen voice: downloaded once (about 80 MB with the engine), then kept on
+// the device by the browser.
+function loadNatural(showProgress) {
+  const voiceId = speech.naturalVoice;
+  if (natural.session && natural.voiceLoaded === voiceId) return Promise.resolve(natural.session);
+  if (natural.loading && natural.loadingVoice === voiceId) {
+    if (showProgress) busy('Getting the natural voice ready…');
+    return natural.loading;
+  }
+  const msg = 'Downloading the natural voice (about 80 MB, only the first time)…';
+  if (showProgress) busy('Getting the natural voice ready…');
+  natural.loadingVoice = voiceId;
+  const job = (async () => {
+    if (!natural.mod) natural.mod = await import(PIPER_URL);
+    natural.mod.TtsSession._instance = null; // a new voice needs a fresh session
+    const session = await natural.mod.TtsSession.create({
+      voiceId,
+      wasmPaths: PIPER_PATHS,
+      progress: (p) => {
+        if (showProgress && p.total && p.url !== natural.mod.INFERENCE_PROGRESS_URL) busy(msg, p.loaded / p.total);
+      },
+    });
+    if (natural.loadingVoice === voiceId) {
+      natural.session = session;
+      natural.voiceLoaded = voiceId;
+    }
+    return session;
+  })();
+  natural.loading = job;
+  job.then(() => { if (showProgress) busy(false); }, (err) => {
+    console.error(err);
+    if (natural.loading === job) natural.loading = null;
+    busy(false);
+    note('readerNote', 'The natural voice could not be loaded. Check the internet connection, or pick another voice.');
+  });
+  return job;
+}
+
+// Make the audio for one sentence (kept, so tapping again plays at once).
+function naturalClip(text) {
+  const key = speech.naturalVoice + '|' + text;
+  if (natural.cache.has(key)) return natural.cache.get(key);
+  const job = (async () => {
+    const session = await loadNatural(false);
+    const blob = await session.predict(text);
+    // Find where the speaking actually starts and stops (skip the quiet bits at each end).
+    if (!natural.decodeCtx) natural.decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const audio = await natural.decodeCtx.decodeAudioData(await blob.arrayBuffer());
+    const a = audio.getChannelData(0);
+    let s = 0, e = a.length - 1;
+    while (s < e && Math.abs(a[s]) < 0.02) s++;
+    while (e > s && Math.abs(a[e]) < 0.02) e--;
+    return {
+      url: URL.createObjectURL(blob), duration: audio.duration,
+      start: s / audio.sampleRate, end: e / audio.sampleRate,
+    };
+  })();
+  natural.cache.set(key, job);
+  job.catch(() => natural.cache.delete(key));
+  return job;
+}
+
+// When each word starts: share the spoken time out by word length, with extra time
+// for the pauses after commas and full stops.
+function wordStartTimes(words, start, end) {
+  const weight = (t) => t.replace(/[^A-Za-z0-9]/g, '').length + 2 +
+    (/[,;:]["')”’]*$/.test(t) ? 3 : 0) + (/[.!?]["')”’]*$/.test(t) ? 5 : 0);
+  const ws = words.map((w) => weight(w.text));
+  const total = ws.reduce((s, v) => s + v, 0) || 1;
+  let acc = 0;
+  return ws.map((v) => { const t = start + (acc / total) * (end - start); acc += v; return t; });
+}
+
+// Play one sentence's audio, moving the highlight along the words. Resolves true when
+// it finished, false when it was stopped.
+function playClip(clip, words, tok) {
+  const el = audioEl();
+  el.src = clip.url;
+  el.defaultPlaybackRate = speech.rate;
+  el.playbackRate = speech.rate;
+  const times = wordStartTimes(words, clip.start, clip.end);
+  return new Promise((resolve) => {
+    el.play().catch((err) => {
+      console.error(err);
+      note('readerNote', 'The iPad blocked the sound. Tap the box again to hear it.');
+      resolve(false);
+    });
+    // The first word lights up as the sentence starts, so it is never skipped.
+    let i = 0;
+    highlightWord(words[0]);
+    const tick = () => {
+      if (tok !== speech.token) return resolve(false);
+      const t = el.currentTime; // time within the recording, whatever the speed
+      while (i + 1 < words.length && t >= times[i + 1]) highlightWord(words[++i]);
+      if (el.ended || t >= clip.duration - 0.02) return resolve(true);
+      natural.timer = setTimeout(tick, 30);
+    };
+    tick();
+  });
+}
+
+async function speakNatural(sentences, tok) {
+  const text = (ws) => ws.map((w) => w.text).join(' ');
+  if (!(natural.session && natural.voiceLoaded === speech.naturalVoice)) loadNatural(true);
+  let next = naturalClip(text(sentences[0]));
+  for (let i = 0; i < sentences.length; i++) {
+    const words = sentences[i];
+    setSentence(words); // show the sentence while its sound is being made
+    let clip;
+    try { clip = await next; } catch { return; }
+    if (tok !== speech.token) return;
+    busy(false);
+    if (i + 1 < sentences.length) next = naturalClip(text(sentences[i + 1])); // get the next one ready
+    if (!await playClip(clip, words, tok)) return;
+  }
+  if (tok === speech.token) clearHighlights();
+}
+
 function stopSpeech() {
   speech.token++;
   if ('speechSynthesis' in window) speechSynthesis.cancel();
+  if (natural.el) natural.el.pause();
+  clearTimeout(natural.timer);
   speech.handles.forEach((h) => { clearTimeout(h.check); clearTimeout(h.timer); });
   speech.handles = [];
   clearHighlights();
@@ -1635,6 +1836,14 @@ function highlightWord(w) {
 }
 
 function speakZone(zone) {
+  if (speech.engine === 'natural') {
+    stopSpeech();
+    unlockAudio(); // switch sound on now, during the tap
+    state.lastZone = zone;
+    state.zoneEls[zone.id].classList.add('active');
+    speakNatural(zone.sentences, speech.token);
+    return;
+  }
   if (!('speechSynthesis' in window)) { note('readerNote', 'This browser cannot read out loud.'); return; }
   stopSpeech();
   const tok = speech.token;
@@ -1690,6 +1899,12 @@ function estimateWords(words, tok, h) {
 }
 
 function speakWord(word) {
+  if (speech.engine === 'natural') {
+    stopSpeech();
+    unlockAudio();
+    speakNatural([[{ ...word, text: word.text.replace(/[.,!?;:]+$/, '') }]], speech.token);
+    return;
+  }
   if (!('speechSynthesis' in window)) return;
   stopSpeech();
   const tok = speech.token;

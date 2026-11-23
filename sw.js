@@ -2,8 +2,8 @@
    The app's own files: always ask the website for the newest copy first (skipping the
    browser's own cache), and only use the saved copy when there is no connection.
    The reader library from the CDN: use the saved copy (it never changes for a version). */
-const CACHE = 'read-along-v6';
-const APP_FILES = ['./', 'index.html', 'styles.css?v=6', 'app.js?v=6', 'manifest.json', 'icons/icon-180.png', 'icons/icon-192.png'];
+const CACHE = 'read-along-v7';
+const APP_FILES = ['./', 'index.html', 'styles.css?v=7', 'app.js?v=7', 'manifest.json', 'icons/icon-180.png', 'icons/icon-192.png'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(
