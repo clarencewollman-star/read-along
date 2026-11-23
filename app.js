@@ -3,6 +3,12 @@
 /* Read Along — photograph a workbook page, find the text, tap a zone to hear it. */
 
 const $ = (id) => document.getElementById(id);
+
+// Shown at the top of every screen. Bump with every update (and the ?v= numbers in
+// index.html and CACHE in sw.js), so it's easy to see the newest version is running.
+const APP_VERSION = '6';
+const APP_DATE = 'Nov 23, 2026';
+$('version').textContent = 'Version ' + APP_VERSION + ' · ' + APP_DATE;
 const MAX_SIDE = 2400;          // largest photo side we keep (pixels)
 const PAGE_SIDE = 2600;         // long side of the straightened page used for reading
 const ZONE_COLORS = ['#4f8cff', '#22b07d', '#ff8a3d', '#b46bff', '#ff5c8a', '#14b8c4'];
@@ -1395,7 +1401,10 @@ function setEditing(on) {
 function selectZone(spec) {
   edit.selected = spec;
   $('btnRemoveZone').disabled = spec < 0;
-  state.zoneEls.forEach((el, i) => el.classList.toggle('selected', state.zones[i].spec === spec));
+  state.zoneEls.forEach((el) => {
+    const z = state.zones[+el.dataset.z];
+    el.classList.toggle('selected', !!z && z.spec === spec);
+  });
 }
 
 $('overlay').addEventListener('pointerdown', (e) => {
@@ -1700,8 +1709,25 @@ $('btnReplay').addEventListener('click', () => { if (state.lastZone) speakZone(s
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') stopSpeech(); });
 
 // Offline copy + "Add to Home Screen" support (only works over https or localhost).
+// Every time the app opens it checks for a newer version; when one has been installed,
+// the page reloads once so the new version is used right away.
 if ('serviceWorker' in navigator && window.isSecureContext) {
-  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (hadController && !reloaded) { reloaded = true; window.location.reload(); }
+  });
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' })
+      .then((reg) => reg.update())
+      .catch(() => {});
+  });
+  // An app on the home screen can stay open for days: check again when it comes back.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      navigator.serviceWorker.getRegistration().then((reg) => reg && reg.update()).catch(() => {});
+    }
+  });
 }
 
 // Exposed for testing in the browser console.

@@ -28,6 +28,7 @@ body.has-caption { padding-bottom: 160px; }
   border-bottom: 1px solid var(--line);
 }
 .topbar h1 { font-size: 1.3rem; margin: 0; }
+.version { margin-left: auto; font-size: 0.95rem; color: var(--muted); white-space: nowrap; }
 
 .screen { display: none; padding: 16px; max-width: 1000px; margin: 0 auto; }
 .screen.active { display: block; }
