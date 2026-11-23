@@ -535,7 +535,7 @@ async function readPage() {
       }
       lines.push(...best.found);
     }
-    buildZones(lines);
+    buildZones(lines, regions);
     renderReader();
     busy(false);
     show('reader');
@@ -830,62 +830,231 @@ function collectLines(data, map) {
   return lines;
 }
 
-/* Typical letter height in a line (upper quarter of its word heights). */
-function textHeight(line) {
-  const hs = line.words.map((w) => w.bbox.y1 - w.bbox.y0).sort((a, b) => a - b);
-  return hs[Math.min(hs.length - 1, Math.floor(hs.length * 0.75))];
+/* Find the blocks of print on the page the way a person sees them: smudge the ink
+   sideways and a little downwards so the letters and lines of one paragraph run together
+   into one blob, while the blank space around a paragraph, heading or question keeps it
+   apart. Blobs never cross from one reading region (column) into another.
+   Returns a function giving the block number at a page point (0 = none). */
+function findBlocks(canvas, regions, textH) {
+  const W = canvas.width, H = canvas.height;
+  const w = 600, f = w / W, h = Math.max(1, Math.round(H * f));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(canvas, 0, 0, w, h);
+  const p = ctx.getImageData(0, 0, w, h).data;
+  let ink = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) ink[i] = p[i * 4] < 150 ? 1 : 0;
+  for (let x = 0; x < w; x++) { // dark page edges / background are not print
+    let n = 0;
+    for (let y = 0; y < h; y++) n += ink[y * w + x];
+    if (n > h * 0.35) for (let y = 0; y < h; y++) ink[y * w + x] = 0;
+  }
+
+  // Which column each pixel belongs to. Full-width strips all count as one area, so a
+  // paragraph is never split just because it was read in two strips.
+  const rid = new Int16Array(w * h).fill(-1);
+  regions.forEach((r, idx) => {
+    const i = r.left || r.right ? idx : 9999;
+    const y0 = Math.max(0, Math.floor(r.y * f)), y1 = Math.min(h, Math.ceil((r.y + r.h) * f));
+    for (let y = y0; y < y1; y++) {
+      const Y = y / f;
+      let xl = r.x, xr = r.x + r.w;
+      if (r.left) xl = Math.max(xl, r.left(Y));
+      if (r.right) xr = Math.min(xr, r.right(Y));
+      for (let x = Math.max(0, Math.floor(xl * f)); x < Math.min(w, Math.ceil(xr * f)); x++) rid[y * w + x] = i;
+    }
+  });
+
+  // Smudge: sideways about one letter-height (joins words), down/up about half (joins lines,
+  // but not across the blank line between paragraphs).
+  const th = textH * f;
+  const rx = Math.max(2, Math.round(th * 0.9)), ry = Math.max(2, Math.round(th * 0.55));
+  const smear = (src, horizontal) => {
+    const out = new Uint8Array(w * h);
+    const n = horizontal ? w : h, lines = horizontal ? h : w, r = horizontal ? rx : ry;
+    const pre = new Int32Array(n + 1);
+    for (let l = 0; l < lines; l++) {
+      const at = (k) => (horizontal ? l * w + k : k * w + l);
+      for (let k = 0; k < n; k++) pre[k + 1] = pre[k] + src[at(k)];
+      for (let k = 0; k < n; k++) {
+        if (pre[Math.min(n, k + r + 1)] - pre[Math.max(0, k - r)] > 0) out[at(k)] = 1;
+      }
+    }
+    return out;
+  };
+  ink = smear(smear(ink, true), false);
+
+  const label = new Int32Array(w * h);
+  const queue = new Int32Array(w * h);
+  let next = 1;
+  for (let s = 0; s < w * h; s++) {
+    if (!ink[s] || label[s] || rid[s] < 0) continue;
+    let head = 0, tail = 0;
+    queue[tail++] = s;
+    label[s] = next;
+    while (head < tail) {
+      const q = queue[head++], x = q % w, y = (q / w) | 0;
+      for (const n2 of [x > 0 ? q - 1 : -1, x < w - 1 ? q + 1 : -1, y > 0 ? q - w : -1, y < h - 1 ? q + w : -1]) {
+        if (n2 >= 0 && ink[n2] && !label[n2] && rid[n2] === rid[s]) { label[n2] = next; queue[tail++] = n2; }
+      }
+    }
+    next++;
+  }
+
+  return (X, Y) => {
+    const x = Math.round(X * f), y = Math.round(Y * f);
+    for (let r = 0; r <= 3; r++) {
+      for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+        const xx = x + dx, yy = y + dy;
+        if (xx >= 0 && yy >= 0 && xx < w && yy < h && label[yy * w + xx]) return label[yy * w + xx];
+      }
+    }
+    return 0;
+  };
 }
 
-/* Vertical middle of a line's first word: lines in one column start at the same x,
-   so comparing first words is not thrown off by slanted lines. */
-function lineStart(line) {
-  const b = line.words[0].bbox;
-  return (b.y0 + b.y1) / 2;
-}
-
-/* Group text lines into zones: lines close together belong to one zone; a bigger gap,
-   a change in text size, or a numbered/lettered item starts a new zone. */
-function buildZones(allLines) {
+/* Build zones: each block of print is a zone, except that a numbered or lettered item
+   ("1.", "b)") starts a zone of its own so every question can be tapped by itself. */
+function buildZones(allLines, regions) {
   // A page number or a stray letter on its own is not worth a zone.
   const lines = allLines.filter((l) => {
     const t = l.words.map((w) => w.text).join(' ');
     return !(/^\d{1,3}$/.test(t) || t.replace(/[^A-Za-z]/g, '').length < 2 && !/\d/.test(t));
   });
+  const heights = lines.flatMap((l) => l.words.map((w) => w.bbox.y1 - w.bbox.y0)).sort((a, b) => a - b);
+  const textH = heights.length ? heights[heights.length >> 1] : 30;
+  const blockAt = findBlocks(state.ocrCanvas, regions, textH);
 
-  const groups = [];
-  let cur = null;
-  for (const line of lines) {
-    const prev = cur && cur[cur.length - 1];
-    let join = false;
-    if (prev) {
-      // Measure with word heights, not whole-line boxes: on a curved page a slanted
-      // line's box is much taller than its letters.
-      const hPrev = textHeight(prev), hLine = textHeight(line);
-      const step = lineStart(line) - lineStart(prev); // distance from one line to the next
-      const overlapX = Math.min(prev.bbox.x1, line.bbox.x1) - Math.max(prev.bbox.x0, line.bbox.x0);
-      const sameSize = Math.max(hPrev, hLine) / Math.max(1, Math.min(hPrev, hLine)) < 1.4;
-      const startsItem = /^(\d{1,2}|[a-hA-H])[.)]$/.test(line.words[0].text);
-      join = step > hLine * 0.4 && step < Math.max(hPrev, hLine) * 2.1 &&
-             overlapX > 0 && sameSize && !startsItem;
+  const groups = new Map(); // zone key -> words, in reading order
+  const part = new Map();   // block -> how many numbered items it has been split into
+  lines.forEach((line, li) => {
+    const startsItem = /^(\d{1,2}|[a-hA-H])[.)]$/.test(line.words[0].text);
+    for (const w of line.words) {
+      const b = blockAt((w.bbox.x0 + w.bbox.x1) / 2, (w.bbox.y0 + w.bbox.y1) / 2);
+      let key;
+      if (!b) key = 'line' + li;
+      else {
+        if (startsItem && w === line.words[0] && groups.has('b' + b + '.' + (part.get(b) || 0))) {
+          part.set(b, (part.get(b) || 0) + 1);
+        }
+        key = 'b' + b + '.' + (part.get(b) || 0);
+      }
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push({ ...w, line: li });
     }
-    if (join) cur.push(line); else groups.push((cur = [line]));
-  }
+  });
 
   const zones = [];
   const words = [];
-  for (const g of groups) {
-    const zw = [];
-    for (const line of g) {
-      for (const w of line.words) {
+  for (const g of groups.values()) {
+    for (const para of splitParagraphs(readingRows(g, textH), textH)) {
+      const zw = para.flat();
+      // A speck with hardly any letters is not worth a zone.
+      if (zw.map((w) => w.text).join('').replace(/[^A-Za-z0-9]/g, '').length < 2) continue;
+      const zoneWords = zw.map((w) => {
         const word = { id: words.length, text: w.text, bbox: w.bbox, zone: zones.length };
         words.push(word);
-        zw.push(word);
-      }
+        return word;
+      });
+      zones.push({ id: zones.length, words: zoneWords, box: unionBox(zoneWords), sentences: splitSentences(zoneWords) });
     }
-    zones.push({ id: zones.length, words: zw, box: unionBox(g), sentences: splitSentences(zw) });
   }
   state.zones = zones;
   state.words = words;
+}
+
+/* Split one block's rows (lines) into paragraphs, the way books mark them when there is
+   no blank line between: a new paragraph starts
+   - on an indented line, right after a line that finished a sentence, or
+   - after a line that finished a sentence well short of the right edge. */
+function splitParagraphs(rows, textH) {
+  if (rows.length < 2) return [rows];
+  const start = rows.map((r) => Math.min(...r.map((w) => w.bbox.x0)));
+  const end = rows.map((r) => Math.max(...r.map((w) => w.bbox.x1)));
+  const fullEnd = [...end].sort((a, b) => a - b)[Math.floor(end.length * 0.75)];
+  const endsSentence = (r) => /[.!?:]["')\]”’]*$/.test(r[r.length - 1].text);
+  const paras = [[rows[0]]];
+  for (let i = 1; i < rows.length; i++) {
+    const prevDone = endsSentence(rows[i - 1]);
+    const indented = start[i] > start[i - 1] + textH * 0.7 &&
+      (i + 1 >= rows.length || start[i + 1] < start[i] - textH * 0.5);
+    const prevShort = end[i - 1] < fullEnd - textH * 2.5;
+    if (prevDone && (indented || prevShort)) paras.push([]);
+    paras[paras.length - 1].push(rows[i]);
+  }
+  return paras;
+}
+
+/* Put a block's words in reading order, as rows (lines) of words. The reader's word order
+   inside one of its lines is kept; whole lines (or pieces of lines) are sorted top to
+   bottom, measured along the slant of the text, and pieces on the same row go left to right. */
+function readingRows(ws, textH) {
+  const lines = new Map();
+  ws.forEach((w) => { if (!lines.has(w.line)) lines.set(w.line, []); lines.get(w.line).push(w); });
+  const pieces = [...lines.values()].map((lw) => ({ words: lw, bbox: unionBox(lw) }));
+  return orderByPosition(pieces, textH, ws).map((row) => row.flatMap((p) => p.words));
+}
+
+/* Sort items (anything with a bbox) into rows, top to bottom along the text's slant,
+   left to right within a row. The slant is measured from `slopeFrom` words. */
+function orderByPosition(ws, textH, slopeFrom) {
+  const cx = (w) => (w.bbox.x0 + w.bbox.x1) / 2, cy = (w) => (w.bbox.y0 + w.bbox.y1) / 2;
+  // Slant: median slope of the reader's lines that have 3+ words.
+  const byLine = new Map();
+  slopeFrom.forEach((w) => { if (!byLine.has(w.line)) byLine.set(w.line, []); byLine.get(w.line).push(w); });
+  const slopes = [];
+  for (const lw of byLine.values()) {
+    if (lw.length < 3) continue;
+    const mx = lw.reduce((s, w) => s + cx(w), 0) / lw.length, my = lw.reduce((s, w) => s + cy(w), 0) / lw.length;
+    let num = 0, den = 0;
+    for (const w of lw) { num += (cx(w) - mx) * (cy(w) - my); den += (cx(w) - mx) ** 2; }
+    if (den > 0) slopes.push(num / den);
+  }
+  slopes.sort((a, b) => a - b);
+  const slope = slopes.length ? Math.max(-0.3, Math.min(0.3, slopes[slopes.length >> 1])) : 0;
+
+  const items = ws.map((w) => ({ w, x: cx(w), y: cy(w) - slope * cx(w) }));
+  items.sort((a, b) => a.y - b.y);
+  const rows = [];
+  for (const it of items) {
+    const row = rows[rows.length - 1];
+    if (row && it.y - row.y < textH * 0.6) row.items.push(it);
+    else rows.push({ y: it.y, items: [it] });
+  }
+  return rows.map((r) => r.items.sort((a, b) => a.x - b.x).map((it) => it.w));
+}
+
+/* Make sure no two zone boxes overlap: where two boxes cross, move the shared edge to
+   the middle of the overlap — between rows for boxes stacked above each other,
+   between columns for boxes side by side. */
+function separateBoxes(boxes) {
+  for (let pass = 0; pass < 4; pass++) {
+    let changed = false;
+    for (let i = 0; i < boxes.length; i++) {
+      for (let j = i + 1; j < boxes.length; j++) {
+        const a = boxes[i], b = boxes[j];
+        const ox = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0);
+        const oy = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
+        if (ox <= 0 || oy <= 0) continue;
+        changed = true;
+        // Cut along whichever direction needs the smaller trim.
+        if (oy / Math.min(a.y1 - a.y0, b.y1 - b.y0) <= ox / Math.min(a.x1 - a.x0, b.x1 - b.x0)) {
+          const [top, bot] = (a.y0 + a.y1) <= (b.y0 + b.y1) ? [a, b] : [b, a];
+          const mid = (Math.max(a.y0, b.y0) + Math.min(a.y1, b.y1)) / 2;
+          top.y1 = Math.min(top.y1, mid - 1);
+          bot.y0 = Math.max(bot.y0, mid + 1);
+        } else {
+          const [lft, rgt] = (a.x0 + a.x1) <= (b.x0 + b.x1) ? [a, b] : [b, a];
+          const mid = (Math.max(a.x0, b.x0) + Math.min(a.x1, b.x1)) / 2;
+          lft.x1 = Math.min(lft.x1, mid - 1);
+          rgt.x0 = Math.max(rgt.x0, mid + 1);
+        }
+      }
+    }
+    if (!changed) break;
+  }
+  return boxes;
 }
 
 function splitSentences(words) {
@@ -908,15 +1077,21 @@ function renderReader() {
   const pct = (v, total) => (v / total) * 100 + '%';
   const pad = Math.round(Math.max(W, H) * 0.006);
 
-  state.zoneEls = state.zones.map((z) => {
+  // A little breathing room around each zone, then trim so no two zones overlap.
+  const boxes = separateBoxes(state.zones.map((z) => ({
+    x0: z.box.x0 - pad, y0: z.box.y0 - pad, x1: z.box.x1 + pad, y1: z.box.y1 + pad,
+  })));
+
+  state.zoneEls = state.zones.map((z, i) => {
+    const b = boxes[i];
     const el = document.createElement('div');
     el.className = 'zone';
     el.dataset.z = z.id;
     el.style.setProperty('--zc', ZONE_COLORS[z.id % ZONE_COLORS.length]);
-    el.style.left = pct(z.box.x0 - pad, W);
-    el.style.top = pct(z.box.y0 - pad, H);
-    el.style.width = pct(z.box.x1 - z.box.x0 + pad * 2, W);
-    el.style.height = pct(z.box.y1 - z.box.y0 + pad * 2, H);
+    el.style.left = pct(b.x0, W);
+    el.style.top = pct(b.y0, H);
+    el.style.width = pct(Math.max(1, b.x1 - b.x0), W);
+    el.style.height = pct(Math.max(1, b.y1 - b.y0), H);
     overlay.appendChild(el);
     return el;
   });
