@@ -6,7 +6,7 @@ const $ = (id) => document.getElementById(id);
 
 // Shown at the top of every screen. Bump with every update (and the ?v= numbers in
 // index.html and CACHE in sw.js), so it's easy to see the newest version is running.
-const APP_VERSION = '8';
+const APP_VERSION = '9';
 const APP_DATE = 'Nov 23, 2026';
 $('version').textContent = 'Version ' + APP_VERSION + ' · ' + APP_DATE;
 const MAX_SIDE = 2400;          // largest photo side we keep (pixels)
@@ -635,10 +635,12 @@ function unbend(src, bend) {
 function enhanceForOcr(src) {
   const w = src.width, h = src.height;
   const p = src.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
-  const gray = new Uint8Array(w * h);
+  let gray = new Uint8Array(w * h);
   for (let i = 0, j = 0; i < gray.length; i++, j += 4) {
     gray[i] = Math.min(p[j], p[j + 1], p[j + 2]);
   }
+  const cleaned = smoothAndSharpen(gray, w, h);
+  gray = cleaned.gray;
 
   // Paper brightness on a coarse grid: brightest pixel per cell, then spread and smooth it.
   const S = 32;
@@ -671,7 +673,10 @@ function enhanceForOcr(src) {
   const octx = out.getContext('2d');
   const img = octx.createImageData(w, h);
   const o = img.data;
-  const LO = 0.45, HI = 0.86; // ratio to paper: below LO = solid ink, above HI = paper
+  // ratio to paper: below LO = solid ink, above HI = paper. A very grainy photo gets
+  // slightly lower cut-offs, so letters don't come out fat and leftover grain turns white.
+  const tune = window.__ocrOpts || {};
+  const LO = tune.lo ?? (cleaned.heavy ? 0.42 : 0.45), HI = tune.hi ?? (cleaned.heavy ? 0.82 : 0.86);
   for (let y = 0; y < h; y++) {
     const gy = Math.min(gh - 1.001, Math.max(0, y / S - 0.5));
     const y0 = gy | 0, fy = gy - y0, y1 = Math.min(gh - 1, y0 + 1);
@@ -691,6 +696,82 @@ function enhanceForOcr(src) {
   return out;
 }
 
+/* A page photographed in dim light looks gray and murky on screen. Brighten the shown
+   page so the paper looks white again (the colors keep their balance). */
+function brightenIfDim(canvas) {
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const img = ctx.getImageData(0, 0, w, h), p = img.data;
+  const levels = [];
+  for (let i = 0; i < p.length; i += 4 * 97) levels.push(Math.max(p[i], p[i + 1], p[i + 2]));
+  levels.sort((a, b) => a - b);
+  const paper = levels[(levels.length * 0.9) | 0] || 255;
+  if (paper >= 200) return;
+  const gain = Math.min(3, 235 / Math.max(1, paper));
+  const lut = new Uint8ClampedArray(256);
+  for (let v = 0; v < 256; v++) lut[v] = v * gain;
+  for (let i = 0; i < p.length; i += 4) { p[i] = lut[p[i]]; p[i + 1] = lut[p[i + 1]]; p[i + 2] = lut[p[i + 2]]; }
+  ctx.putImageData(img, 0, 0);
+}
+
+/* Average over a (2r+1) x (2r+1) square around every pixel (fast: running sums). */
+function boxBlur(src, w, h, r) {
+  const n = 2 * r + 1, tmp = new Float32Array(w * h), out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    let s = 0;
+    for (let x = -r; x <= r; x++) s += src[row + Math.min(w - 1, Math.max(0, x))];
+    for (let x = 0; x < w; x++) {
+      tmp[row + x] = s / n;
+      s += src[row + Math.min(w - 1, x + r + 1)] - src[row + Math.max(0, x - r)];
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let s = 0;
+    for (let y = -r; y <= r; y++) s += tmp[Math.min(h - 1, Math.max(0, y)) * w + x];
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = s / n;
+      s += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x];
+    }
+  }
+  return out;
+}
+
+/* Photos taken in low light are grainy (the camera turns up its sensitivity) and often a
+   little blurry. Grain turns into thousands of specks that the reader tries to read as
+   letters, which makes it slow and wrong. So: measure how grainy the paper is, smooth
+   the grain away by that much, then sharpen the edges of the letters again. */
+function smoothAndSharpen(gray, w, h) {
+  // Grain: how much side-by-side pixels differ on plain paper, compared with how bright it is.
+  const diffs = [], levels = [];
+  for (let y = 8; y < h - 8; y += 6) {
+    for (let x = 8; x < w - 9; x += 3) {
+      const i = y * w + x, a = gray[i], b = gray[i + 1], c = gray[i + w];
+      // only smooth, bright spots (paper), not the edges of letters
+      if (Math.abs(a - c) < 40 && Math.abs(a - b) < 40) { diffs.push(Math.abs(a - b)); levels.push(a); }
+    }
+  }
+  if (diffs.length < 1000) return { gray, heavy: false };
+  levels.sort((a, b) => a - b);
+  const paper = Math.max(20, levels[(levels.length * 0.9) | 0]);
+  diffs.sort((a, b) => a - b);
+  const grain = (diffs[(diffs.length * 0.75) | 0] + 0.5) / paper;
+  const tune = window.__ocrOpts || {};
+  const r = tune.r ?? (grain < 0.02 ? 0 : grain < 0.08 ? 1 : 2);
+  const amount = tune.amount ?? (r ? 0.8 : 0); // a clean photo reads best left as it is
+  if (window.__ocrOpts) window.__ocrInfo = { paper, grain: +grain.toFixed(3), r, amount };
+  if (!r && !amount) return { gray, heavy: false };
+  const base = r ? boxBlur(boxBlur(gray, w, h, r), w, h, r) : gray;
+  // Sharpen: push each pixel away from the average of its wider neighbourhood.
+  const wide = boxBlur(base, w, h, 3);
+  const out = new Uint8Array(w * h);
+  for (let i = 0; i < out.length; i++) {
+    const v = base[i] + amount * (base[i] - wide[i]);
+    out[i] = v < 0 ? 0 : v > 255 ? 255 : v;
+  }
+  return { gray: out, heavy: r >= 2 };
+}
+
 const STATUS_TEXT = {
   'loading tesseract core': 'Getting the reader ready…',
   'initializing tesseract': 'Getting the reader ready…',
@@ -699,22 +780,57 @@ const STATUS_TEXT = {
   'recognizing text': 'Finding the words…',
 };
 
-async function getWorker() {
-  if (!state.worker) {
-    state.worker = await Tesseract.createWorker('eng', 1, {
-      logger: (m) => { if (STATUS_TEXT[m.status]) busy(STATUS_TEXT[m.status], m.progress); },
-    });
-  }
-  return state.worker;
+/* Several text readers work side by side, each on its own column, which makes reading
+   a page several times faster. An iPad gets 2 (to save memory), a computer up to 3.
+   They start in the background as soon as the app opens, while a photo is being taken. */
+const IS_IPAD = /iPad|iPhone/.test(navigator.userAgent) ||
+  (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+const READERS = Math.max(1, Math.min(IS_IPAD ? 2 : 3, (navigator.hardwareConcurrency || 2) - 1));
+const pool = { first: null, free: [], waiting: [] };
+
+function releaseReader(w) {
+  const next = pool.waiting.shift();
+  if (next) next(w); else pool.free.push(w);
 }
+
+function startReaders() {
+  if (!pool.first) {
+    // Only show progress when the person is waiting (the busy box is up).
+    const logger = (m) => { if (!$('busy').hidden && STATUS_TEXT[m.status]) busy(STATUS_TEXT[m.status], m.progress); };
+    // The first reader downloads the English words once; the others then use the stored copy.
+    pool.first = Tesseract.createWorker('eng', 1, { logger }).then((w) => {
+      releaseReader(w);
+      for (let i = 1; i < READERS; i++) {
+        Tesseract.createWorker('eng', 1).then(releaseReader).catch(() => {});
+      }
+    });
+    pool.first.catch(() => { pool.first = null; }); // no connection: try again next time
+  }
+  return pool.first;
+}
+
+/* Borrow a free reader, use it, and hand it back. */
+async function withReader(job) {
+  await startReaders();
+  const w = pool.free.pop() || await new Promise((res) => pool.waiting.push(res));
+  try { return await job(w); } finally { releaseReader(w); }
+}
+
+window.addEventListener('load', () => setTimeout(() => startReaders().catch(() => {}), 500));
 
 async function readPage() {
   try {
+    const times = {}, t0 = performance.now();
+    let tLast = t0;
+    const lap = (name) => { const t = performance.now(); times[name] = Math.round(t - tLast); tLast = t; };
     busy('Getting the reader ready…');
-    const worker = await getWorker();
+    await startReaders();
+    lap('reader ready');
     busy('Cleaning up the picture…');
     await new Promise((r) => setTimeout(r, 30));
     state.ocrCanvas = enhanceForOcr(state.pageCanvas);
+    brightenIfDim(state.pageCanvas);
+    lap('clean up');
     // A curved page: straighten the lines of print first (the page shown is straightened
     // too, so the highlights land on the right words).
     busy('Straightening curved lines…');
@@ -724,18 +840,27 @@ async function readPage() {
       state.ocrCanvas = unbend(state.ocrCanvas, bend);
       state.pageCanvas = unbend(state.pageCanvas, bend);
     }
+    lap('flatten');
     // Read each column on its own, top to bottom and left to right. Curved pages
     // otherwise make lines from side-by-side columns run into each other.
     const regions = findRegions(state.ocrCanvas);
-    const lines = [];
-    for (let i = 0; i < regions.length; i++) {
-      busy('Finding the words…', i / regions.length);
-      lines.push(...await readRegionLines(regions[i]));
-    }
+    lap('columns');
+    let done = 0;
+    busy('Finding the words…', 0);
+    const perRegion = await Promise.all(regions.map((r) => readRegionLines(r).then((found) => {
+      busy('Finding the words…', ++done / regions.length);
+      return found;
+    })));
+    const lines = perRegion.flat();
+    lap('read words');
     state.autoSpecs = buildZones(lines, regions);
     setZones(state.autoSpecs.map((s) => ({ ...s })));
     if (edit.on) setEditing(false);
     renderReader();
+    lap('zones');
+    times.total = Math.round(performance.now() - t0);
+    state.lastTimes = times;
+    console.info('Read Along timing (ms)', times);
     busy(false);
     show('reader');
     note('readerNote', state.zones.length ? '' :
@@ -750,23 +875,21 @@ async function readPage() {
 
 /* Read the text lines in one area of the page (page pixels; may have curved column edges). */
 async function readRegionLines(r) {
-  const worker = await getWorker();
   const crop = cropRegion(state.ocrCanvas, r);
-  const read = async (canvas, map) => {
+  const read = (canvas, map) => withReader(async (worker) => {
     const { data } = await worker.recognize(canvas, {}, { blocks: true, text: false });
     const found = collectLines(data, map);
     return { found, score: found.reduce((s, l) => s + l.score, 0) };
-  };
+  });
   // On a curved page, leveling helps some sections and hurts others:
-  // read tilted sections both ways and keep the version the reader is surer of.
+  // read tilted sections both ways (at the same time) and keep the version the reader is surer of.
   const ox = r.x - CROP_PAD, oy = r.y - CROP_PAD;
-  let best = await read(crop, (x, y) => [x + ox, y + oy]);
+  const straight = read(crop, (x, y) => [x + ox, y + oy]);
   const level = levelText(crop, ox, oy);
-  if (level.canvas !== crop) {
-    const alt = await read(level.canvas, level.map);
-    if (alt.score > best.score) best = alt;
-  }
-  return best.found;
+  const tries = [straight];
+  if (level.canvas !== crop) tries.push(read(level.canvas, level.map));
+  const results = await Promise.all(tries);
+  return results.reduce((a, b) => (b.score > a.score ? b : a)).found;
 }
 
 function cleanWord(t) {
